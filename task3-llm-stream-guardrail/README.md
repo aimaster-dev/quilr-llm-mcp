@@ -10,7 +10,7 @@ characters that could still turn into a match.
 
 ```bash
 pip install -e ".[dev]"
-mock-llm-provider --port 9000 --chunk-size 8 --delay-ms 30    # terminal 1: fake provider
+stream-guardrail-mock --port 9000 --chunk-size 8 --delay-ms 30  # terminal 1: fake provider
 stream-guardrail --port 8080                                   # terminal 2: gateway -> :9000/v1
 ```
 

@@ -228,9 +228,9 @@ def _last_user_message(body: dict[str, Any]) -> str:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    """`mock-llm-provider` console script."""
+    """`stream-guardrail-mock` console script."""
     parser = argparse.ArgumentParser(
-        prog="mock-llm-provider",
+        prog="stream-guardrail-mock",
         description="Mock OpenAI-compatible provider that streams a canned, PII-laden answer. "
         "Set $MOCK_LLM_API_KEY to require a bearer token.",
     )
