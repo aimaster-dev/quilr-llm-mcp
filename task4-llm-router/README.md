@@ -17,6 +17,17 @@ secondary provider; connection errors and `5xx` fail over too unless disabled. O
 responses are never retried. A timed-out primary request is cancelled and its connection closed,
 so a late response can never be used.
 
+## Errors
+
+Every error leaving the gateway has one shape, with a fixed message written by the gateway:
+
+```json
+{"error": {"type": "rate_limit_error", "code": "tenant_token_limit_exceeded", "message": "...", "request_id": "req_..."}}
+```
+
+Upstream bodies, exception text and tracebacks only go to the server logs, under the same
+`request_id`, which is also returned in the `X-Request-Id` header.
+
 ```bash
 pip install -e ".[dev]"
 pytest

@@ -9,6 +9,12 @@ import anyio.abc
 import httpx
 import pytest
 
+from llm_router.errors import (
+    UpstreamError,
+    UpstreamRejectedError,
+    UpstreamTimeoutError,
+    UpstreamUnavailableError,
+)
 from llm_router.router import (
     DEFAULT_PRIMARY_TIMEOUT_SECONDS,
     Completion,
@@ -16,7 +22,6 @@ from llm_router.router import (
     FailureKind,
     ModelRouter,
     Upstream,
-    UpstreamFailedError,
 )
 from tests.upstreams import (
     DripStream,
@@ -58,8 +63,8 @@ async def run(router: ModelRouter, request: dict | None = None) -> Completion:
         return await router.complete(request or REQUEST, request_id="req_test")
 
 
-async def fail(router: ModelRouter) -> UpstreamFailedError:
-    with pytest.raises(UpstreamFailedError) as excinfo:
+async def fail(router: ModelRouter) -> UpstreamError:
+    with pytest.raises(UpstreamError) as excinfo:
         await run(router)
     return excinfo.value
 
@@ -237,10 +242,16 @@ async def test_non_retryable_4xx_is_not_sent_to_the_secondary(status: int) -> No
     secondary = Recorder(ok())
     error = await fail(make_router(Recorder(respond(status, json_body={"error": "nope"})), secondary))
 
-    assert error.final.kind is FailureKind.CLIENT_ERROR
-    assert error.final.status == status
+    assert error.failures[-1].kind is FailureKind.CLIENT_ERROR
+    assert error.failures[-1].status == status
     assert len(error.failures) == 1
     assert secondary.requests == []
+    # A malformed request is the client's problem (400); a provider refusing the gateway's own
+    # credentials or model is not, so the client sees a 502 instead.
+    if status in (400, 413, 422):
+        assert type(error) is UpstreamRejectedError and error.status == 400
+    else:
+        assert type(error) is UpstreamError and error.status == 502
 
 
 RETRYABLE_BY_DEFAULT = [
@@ -265,7 +276,7 @@ async def test_connection_and_server_failover_can_be_disabled(handler, kind: Fai
     policy = FailoverPolicy(on_connection_error=False, on_server_error=False)
     secondary = Recorder(ok())
     error = await fail(make_router(Recorder(handler), secondary, policy))
-    assert error.final.kind is kind
+    assert error.failures[-1].kind is kind
     assert secondary.requests == []
 
 
@@ -287,7 +298,7 @@ async def test_both_upstreams_failing_reports_every_attempt() -> None:
 
     assert [f.kind for f in error.failures] == [FailureKind.RATE_LIMITED, FailureKind.TIMEOUT]
     assert [f.upstream for f in error.failures] == ["primary", "fallback"]
-    assert error.final.kind is FailureKind.TIMEOUT
+    assert isinstance(error, UpstreamTimeoutError) and error.status == 504
     # bounded by the secondary timeout (asyncio may fire a timer up to one clock tick early)
     assert SECONDARY_TIMEOUT - 0.05 <= elapsed < SECONDARY_TIMEOUT + 0.5
 
@@ -295,6 +306,7 @@ async def test_both_upstreams_failing_reports_every_attempt() -> None:
 async def test_without_a_secondary_the_primary_failure_is_final() -> None:
     error = await fail(make_router(Recorder(respond(429)), None))
     assert [f.kind for f in error.failures] == [FailureKind.RATE_LIMITED]
+    assert isinstance(error, UpstreamUnavailableError) and error.status == 503
 
 
 async def test_outer_cancellation_is_not_turned_into_a_failover() -> None:

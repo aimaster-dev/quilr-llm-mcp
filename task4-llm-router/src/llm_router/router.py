@@ -28,6 +28,13 @@ import anyio
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from llm_router.errors import (
+    UpstreamError,
+    UpstreamRejectedError,
+    UpstreamTimeoutError,
+    UpstreamUnavailableError,
+)
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_PRIMARY_TIMEOUT_SECONDS = 3.0
@@ -108,16 +115,28 @@ class AttemptFailure(Exception):
         self.elapsed = elapsed
 
 
-class UpstreamFailedError(Exception):
-    """No upstream produced a completion. ``failures`` lists every attempt in order."""
+#: Upstream 4xx statuses that mean "this request is invalid" rather than "the provider is broken or
+#: misconfigured" (401/403/404 from a provider are the gateway operator's problem, not the client's).
+_REQUEST_REJECTED_STATUSES = frozenset({400, 413, 422})
 
-    def __init__(self, failures: list[AttemptFailure]) -> None:
-        super().__init__(f"no upstream produced a completion ({', '.join(str(f) for f in failures)})")
-        self.failures = failures
 
-    @property
-    def final(self) -> AttemptFailure:
-        return self.failures[-1]
+def gateway_error_for(failures: list[AttemptFailure]) -> UpstreamError:
+    """Map the attempt that ended routing to a sanitized gateway error.
+
+    The client sees only a fixed message chosen here. The attempts themselves (statuses, upstream
+    bodies, exception text) ride along in ``failures`` for the server logs.
+    """
+    final = failures[-1]
+    match final.kind:
+        case FailureKind.TIMEOUT:
+            error_class: type[UpstreamError] = UpstreamTimeoutError
+        case FailureKind.RATE_LIMITED | FailureKind.CONNECTION | FailureKind.SERVER_ERROR:
+            error_class = UpstreamUnavailableError
+        case FailureKind.CLIENT_ERROR if final.status in _REQUEST_REJECTED_STATUSES:
+            error_class = UpstreamRejectedError
+        case _:
+            error_class = UpstreamError
+    return error_class(failures=failures)
 
 
 # -- upstream response schema --------------------------------------------------------------------
@@ -226,7 +245,7 @@ class ModelRouter:
     async def complete(self, request: Mapping[str, Any], *, request_id: str | None = None) -> Completion:
         """Run ``request`` (OpenAI chat-completions fields, minus ``model``) with failover.
 
-        Raises ``UpstreamFailedError`` when no upstream produced a completion.
+        Raises an ``UpstreamError`` subclass when no upstream produced a completion.
         """
         failures: list[AttemptFailure] = []
         candidates = [self.primary] if self.secondary is None else [self.primary, self.secondary]
@@ -247,7 +266,7 @@ class ModelRouter:
                     break
                 continue
             return replace(completion, failed_attempts=tuple(failures))
-        raise UpstreamFailedError(failures)
+        raise gateway_error_for(failures)
 
     async def _attempt(
         self, upstream: Upstream, request: Mapping[str, Any], request_id: str | None
