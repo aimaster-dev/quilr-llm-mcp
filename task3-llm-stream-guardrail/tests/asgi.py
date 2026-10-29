@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import json
-import math
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -59,7 +58,8 @@ async def asgi_request(
     raw = body if isinstance(body, bytes) else json.dumps(body).encode()
     sent_body = False
     disconnect = anyio.Event()
-    send_stream, receive_stream = anyio.create_memory_object_stream[Message](math.inf)
+    # A small buffer keeps the app from running far ahead of the test (it would hide buffering).
+    send_stream, receive_stream = anyio.create_memory_object_stream[Message](8)
 
     async def receive() -> Message:
         nonlocal sent_body
@@ -93,12 +93,13 @@ async def asgi_request(
         async with send_stream:
             await app(scope, receive, send)
 
-    async with anyio.create_task_group() as tg:
-        tg.start_soon(run_app)
-        response = ASGIResponse(receive_stream, disconnect)
-        with anyio.fail_after(10):
-            await response.start()
-        try:
-            yield response
-        finally:
-            disconnect.set()  # let the app's disconnect listener finish if it is still running
+    with receive_stream:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(run_app)
+            response = ASGIResponse(receive_stream, disconnect)
+            with anyio.fail_after(10):
+                await response.start()
+            try:
+                yield response
+            finally:
+                disconnect.set()  # let the app's disconnect listener finish if it is still running

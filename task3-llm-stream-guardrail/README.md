@@ -10,27 +10,40 @@ characters that could still turn into a match.
 
 ```bash
 pip install -e ".[dev]"
-export GUARDRAIL_UPSTREAM_API_KEY=sk-...           # the gateway's own provider key (env only)
-stream-guardrail --upstream-base-url https://api.openai.com/v1 --port 8080
+mock-llm-provider --port 9000 --chunk-size 8 --delay-ms 30    # terminal 1: fake provider
+stream-guardrail --port 8080                                   # terminal 2: gateway -> :9000/v1
 ```
 
 ```bash
-curl -N http://127.0.0.1:8080/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{"model":"gpt-4o-mini","stream":true,
-       "messages":[{"role":"user","content":"Invent a customer record with an email and SSN"}]}'
+curl -N http://127.0.0.1:8080/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"model":"mock-llm-1","stream":true,"messages":[{"role":"user","content":"hi"}]}'
 ```
 
 ```text
-data: {"id":"chatcmpl-…","object":"chat.completion.chunk",…,"choices":[{"index":0,"delta":{"content":"Name: Jane Roe, email "},"finish_reason":null}]}
+data: {"id":"chatcmpl-mock-…","object":"chat.completion.chunk",…,"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
 
-data: {"id":"chatcmpl-…","object":"chat.completion.chunk",…,"choices":[{"index":0,"delta":{"content":"[REDACTED], SSN "},"finish_reason":null}]}
+data: {…"choices":[{"index":0,"delta":{"content":"Sure! "},"finish_reason":null}]}
+
+data: {…"choices":[{"index":0,"delta":{"content":"Here is "},"finish_reason":null}]}
+…
+data: {…"choices":[{"index":0,"delta":{"content":"[REDACTED]. SSN: "},"finish_reason":null}]}
 …
 data: [DONE]
 ```
 
-Tests: `pytest` (derandomized Hypothesis profile, about 2 s) or `HYPOTHESIS_PROFILE=thorough pytest`
-(20,000 random examples per property).
+Put together, the deltas read: *Sure! Here is the customer record you asked for. Name: Jane Roe.
+Email: [REDACTED]. Card on file: [REDACTED], backup card [REDACTED]. SSN: [REDACTED]. Order number
+1234567890123 and version 2.4.1 are not sensitive. Anything else?* (The order number fails Luhn,
+so it is not a card.) Add `"mock": {"echo": true}` to the body to have your own message streamed
+back through the filter.
+
+The mock provider can be tuned with CLI flags or, per request, with a `"mock"` object in the body
+(the gateway forwards it untouched): `chunk_size`, `delay_ms`, `first_token_delay_ms`
+(`--ttft-ms`), `repeat`, `text` and `echo`. It supports `n` and `stream_options.include_usage`.
+Setting `MOCK_LLM_API_KEY` makes it require that bearer token.
+
+Against a real provider:
+`GUARDRAIL_UPSTREAM_API_KEY=sk-... stream-guardrail --upstream-base-url https://api.openai.com/v1`.
 
 ### Configuration
 
@@ -62,10 +75,10 @@ upstream bytes ─▶ SSEParser ─▶ ChatStreamRedactor ─▶ SSE bytes ─�
   goes out in a synthetic chunk **just before** it (same `id`/`model`/`created`), and the finish
   chunk keeps an empty delta. The same happens before `data: [DONE]` and at EOF, so clients that
   stop reading at either point miss nothing.
-- **No extra latency.** Everything one upstream read produces is written to the client before the
-  next read. Chunks whose text is entirely held back, and that carry nothing else (no role,
-  `finish_reason`, `usage` or logprobs), are dropped instead of being sent empty. Comments
-  (`: keep-alive`) and other non-content events pass through.
+- **No extra latency.** Each event is written to the client as soon as it is redacted, even when
+  one upstream read carried many. Chunks whose text is entirely held back, and that carry nothing
+  else (no role, `finish_reason`, `usage` or logprobs), are dropped instead of being sent empty.
+  Comments (`: keep-alive`) and other non-content events pass through.
 - **Non-streaming** (`"stream": false`): `choices[].message.content`, `refusal` and tool-call
   arguments are redacted in the JSON response.
 - **Payloads it does not recognise** (a mid-stream `{"error": …}`, non-JSON `data:`) are redacted
@@ -179,6 +192,71 @@ word, a partial email, or a partial digit group.
 | Held tail | ≤ 64 chars for a run of word characters without `@` (the longest possible local part), ≤ 576 for `local@domain`, ≤ 38 for digit groups. Prose: one word. |
 | Memory per stream | O(`MAX_BUFFERED`) = 577 chars per choice/field, plus one partial SSE line, independent of response length |
 | Work per `feed()` | O(len(chunk) + held tail). Candidates are found by C-level regex scans. `@` and number lookups are cached, so even one-shot redaction of a large text with many rejected candidates stays linear. |
+
+## Tests
+
+`pytest` runs 129 tests in about 6 s, deterministic and with no fixed ports.
+`HYPOTHESIS_PROFILE=thorough pytest` runs 20,000 random examples per property.
+
+| Area | What is proven |
+|------|----------------|
+| Engine (`test_redaction*.py`) | Detector semantics; **streaming == one-shot for any chunking** (Hypothesis + exhaustive 2/3-way splits); buffer ≤ `MAX_BUFFERED` after every chunk; nothing held across `\n`; long runs released |
+| SSE (`test_sse.py`) | Same events for every byte split point, byte-by-byte and random splits (UTF-8, `\r\n`, `\r`) |
+| Chunk transformer (`test_completions.py`) | Per-choice isolation for `n=2`, tool-call arguments, flush-before-`finish_reason` ordering, `[DONE]`/EOF flush, dropped empty chunks |
+| Gateway (`test_gateway.py`) | Redacted SSE, credential handling, sanitized error mapping, mid-stream failure, **disconnect cancels upstream** |
+| Latency and memory (`test_streaming_latency.py`) | **First safe delta reaches the client while the upstream is blocked** waiting for it (a buffering gateway deadlocks); held text waits for one delta only; redactor peak < 64 chars over 5,000+ deltas; traced memory ~100 KB for a 1 MB stream |
+| Real sockets (`test_end_to_end.py`) | Same guarantees over uvicorn + loopback TCP, including disconnect cancellation |
+
+`httpx.ASGITransport` buffers the whole response, so it cannot show streaming. The tests drive the
+gateway through the raw ASGI interface (`tests/asgi.py`) and reach the mock provider through
+`stream_guardrail.testing.StreamingASGITransport`, which hands over each body chunk as it is sent,
+with backpressure.
+
+## Benchmarks
+
+```bash
+python benchmarks/bench_redactor.py     # ~1 min; --quick for a smoke run
+```
+
+Measured on a busy Windows 11 laptop, Python 3.12. For section 3, the servers run in a child
+process and every path is hit in interleaved order.
+
+**1. Engine** (`StreamRedactor.feed()`, 200 KB of LLM-like text with PII about every KB):
+
+| chunk size | µs per chunk | of which redaction | throughput |
+|---:|---:|---:|---:|
+| 1 char | 1.07 | 1.04 | 0.9 MB/s |
+| 4 chars (≈ 1 token) | 1.22 | 1.19 | 3.3 MB/s |
+| 64 chars | 4.31 | 4.28 | 14.9 MB/s |
+| 4 KB | 207 | 207 | 19.7 MB/s |
+
+**2. Gateway pipeline per upstream event** (4-char deltas): 3.0 µs to parse and re-encode the SSE
+event, 9.3 µs with JSON and redaction, so **the guardrail adds about 6 µs of CPU per token**. A
+model emitting 100 tokens/s costs under 0.1 % of a core.
+
+**3. End to end over loopback TCP** (p50 / p95 ms, 200 unpaced and 20 paced requests per path):
+
+| path | first byte | first content | total |
+|---|---:|---:|---:|
+| *mock answers instantly* | | | |
+| direct to mock | 3.95 / 5.64 | 4.00 / 5.89 | 6.69 / 10.20 |
+| gateway, redaction off | 7.16 / 11.94 | 11.07 / 17.66 | 13.92 / 21.62 |
+| gateway, redaction on | 7.12 / 12.77 | 12.20 / 20.57 | 14.55 / 24.53 |
+| *TTFT 50 ms, then a 4-char delta every 20 ms* | | | |
+| direct to mock | 66.30 / 73.87 | 66.73 / 74.16 | 410.05 / 423.33 |
+| gateway, redaction off | 71.27 / 75.65 | 71.51 / 76.32 | 417.18 / 426.28 |
+| gateway, redaction on | 69.29 / 81.35 | 99.98 / 112.09 | 417.91 / 435.16 |
+
+What this shows:
+
+- **Time to first byte does not change** with redaction on. The role chunk is forwarded as soon as
+  it arrives. The proxy hop itself (uvicorn + httpx on Windows loopback) costs about 3 ms.
+- **Total stream time does not change** either: about 0.6 ms more over 65 deltas when the upstream
+  is instant, and within noise at realistic pacing.
+- **First content can arrive one delta later.** The mock's first delta is `Sure`, which could still
+  become `Sure@example.com`, so it waits for `! He` (20 ms here, plus Windows timer granularity).
+  This is the minimum price of never leaking a pattern split across chunks. A first delta that ends
+  in a space or punctuation is forwarded at once (`test_first_safe_chunk…`).
 
 ## Known limitations
 

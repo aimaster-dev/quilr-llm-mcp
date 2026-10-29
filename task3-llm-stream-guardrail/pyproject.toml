@@ -20,6 +20,7 @@ dev = ["pytest>=8", "hypothesis>=6.100"]
 
 [project.scripts]
 stream-guardrail = "stream_guardrail.__main__:main"
+mock-llm-provider = "stream_guardrail.mock_provider:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

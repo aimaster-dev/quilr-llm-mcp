@@ -16,7 +16,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
@@ -155,9 +155,15 @@ class EventStreamResponse(StreamingResponse):
 
 
 class Gateway:
-    def __init__(self, settings: Settings, client: httpx.AsyncClient) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        client: httpx.AsyncClient,
+        redactor_factory: Callable[[], ChatStreamRedactor] = ChatStreamRedactor,
+    ) -> None:
         self.settings = settings
         self.client = client
+        self.redactor_factory = redactor_factory
 
     async def chat_completions(self, request: Request) -> Response:
         started = time.perf_counter()
@@ -265,22 +271,23 @@ class Gateway:
 
     async def _relay(self, upstream: httpx.Response, started: float) -> AsyncGenerator[bytes, None]:
         parser = SSEParser(self.settings.max_event_size)
-        redactor = ChatStreamRedactor()
+        redactor = self.redactor_factory()
         error: GatewayError | None = None
-        first_byte_ms: float | None = None
+        first_event_ms: float | None = None
         try:
             try:
                 async for raw in upstream.aiter_bytes():
-                    # Everything one upstream read produced goes out in one write, straight away.
-                    out = b"".join(e.encode() for ev in parser.feed(raw) for e in redactor.process(ev))
-                    if out:
-                        if first_byte_ms is None:
-                            first_byte_ms = (time.perf_counter() - started) * 1000
-                        yield out
-                out = b"".join(e.encode() for ev in parser.close() for e in redactor.process(ev))
-                out += b"".join(e.encode() for e in redactor.finish())
-                if out:
-                    yield out
+                    # Each event is written as soon as it is redacted, even when one read held many.
+                    for event in parser.feed(raw):
+                        for out in redactor.process(event):
+                            if first_event_ms is None:
+                                first_event_ms = (time.perf_counter() - started) * 1000
+                            yield out.encode()
+                for event in parser.close():
+                    for out in redactor.process(event):
+                        yield out.encode()
+                for out in redactor.finish():
+                    yield out.encode()
             except httpx.TimeoutException:
                 error = _timeout_error()
             except httpx.HTTPError:
@@ -298,9 +305,9 @@ class Gateway:
             with anyio.CancelScope(shield=True):
                 await upstream.aclose()
             logger.info(
-                "completion relayed: stream=true redactions=%d first_byte_ms=%s duration_ms=%.1f",
+                "completion relayed: stream=true redactions=%d first_event_ms=%s duration_ms=%.1f",
                 redactor.redactions,
-                "n/a" if first_byte_ms is None else f"{first_byte_ms:.1f}",
+                "n/a" if first_event_ms is None else f"{first_event_ms:.1f}",
                 (time.perf_counter() - started) * 1000,
             )
 
@@ -315,10 +322,18 @@ def create_client(settings: Settings) -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=timeout, limits=httpx.Limits(max_keepalive_connections=20))
 
 
-def create_app(settings: Settings, client: httpx.AsyncClient | None = None) -> Starlette:
-    """Build the ASGI app. Pass ``client`` to inject a transport (tests); the caller then owns it."""
+def create_app(
+    settings: Settings,
+    client: httpx.AsyncClient | None = None,
+    redactor_factory: Callable[[], ChatStreamRedactor] = ChatStreamRedactor,
+) -> Starlette:
+    """Build the ASGI app.
+
+    ``client`` injects a transport (tests); the caller then owns it. ``redactor_factory`` builds
+    the per-stream redactor (tests and benchmarks swap in instrumented or pass-through ones).
+    """
     owns_client = client is None
-    gateway = Gateway(settings, client or create_client(settings))
+    gateway = Gateway(settings, client or create_client(settings), redactor_factory)
 
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:

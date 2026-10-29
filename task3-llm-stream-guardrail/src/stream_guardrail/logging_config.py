@@ -17,4 +17,7 @@ def configure_logging(level: str | None = None) -> str:
     root = logging.getLogger()
     root.handlers[:] = [handler]
     root.setLevel(resolved)
+    # The gateway logs one summary line per request; httpx's own per-request lines are noise.
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(max(logging.WARNING, root.level))
     return resolved
