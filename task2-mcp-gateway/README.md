@@ -44,6 +44,62 @@ MCP spec forbids passing a token through to a service it was not issued for. The
 verified identity instead, as `X-Gateway-Subject` and `X-Gateway-Role`. Any `X-Gateway-*` header
 sent by the client is dropped first, so it cannot be spoofed.
 
+## Authorization
+
+Only `tools/call` is gated. Every other method (`initialize`, `tools/list`, `ping`,
+`notifications/*`, `resources/*`, ...) and every client response is forwarded unchanged.
+
+| `tools/call` with `params.name` | `admin` | `viewer` |
+|---------------------------------|---------|----------|
+| `get_weather` | forwarded | forwarded |
+| `admin_reset_key`, `admin_delete_user`, ... | forwarded | `-32001` *Unauthorized Tool Call*, **downstream never contacted** |
+
+The denial reuses the request's `id` and is sent with HTTP `200`:
+
+```json
+{"jsonrpc":"2.0","id":7,"error":{"code":-32001,"message":"Unauthorized Tool Call","data":{"requiredRole":"admin"}}}
+```
+
+Why `200` and not `403`: the HTTP exchange worked, and only this one call was refused. MCP clients
+surface it as an ordinary JSON-RPC error for that call (the official SDK raises
+`MCPError(code=-32001)`). A `401`/`403` would look like a broken session or make an OAuth-aware
+client try to refresh its token.
+
+### Failing closed
+
+The gateway decides on its own parse of the request, so it refuses anything another parser (the
+downstream's) could read differently:
+
+| Attempt | Result |
+|---------|--------|
+| `Admin_reset_key`, ` admin_reset_key`, `​admin_reset_key`, full-width `ａｄｍｉｎ_x` | Denied. The prefix check runs on a normalised name (NFKC, case-folded, whitespace and invisible characters removed) |
+| `"method": "Tools/Call"` | Gated like `tools/call` (same normalisation) |
+| Duplicate keys: `{"name":"get_weather","name":"admin_x"}` | `-32700`: parsers disagree on which key wins |
+| Batch `[{...tools/list}, {...admin_reset_key}]` | `-32600`: MCP 2025-06-18 dropped batching, so nothing can hide in one |
+| `tools/call` notification (no `id`) | `-32600`: a notification cannot receive a denial, so it is never forwarded unchecked |
+| `params.name` missing, `null`, a number, an array; `{"name":..., "Name":...}` | `-32602` |
+| `NaN`/`Infinity`, `1e999`, lone surrogates `\ud800`, invalid UTF-8, UTF-16, BOM | `-32700` |
+| `Mcp-Name` / `Mcp-Method` header that contradicts the body (MCP 2026-07-28 routing headers) | `-32020` |
+
+The gateway then forwards **the message it authorized**, re-serialised from the parsed object as
+compact UTF-8 JSON, not the bytes it received. Whatever escapes or whitespace the client used, the
+downstream parses exactly what the gateway checked.
+
+The rules live in `policy.py` and `jsonrpc.py`, which are pure functions with no HTTP in them.
+
+### Audit log
+
+Each request produces exactly one JSON line on the `mcp_gateway.audit` logger (stderr): `allow`
+(forwarded), `deny` (-32001) or `reject` (unauthenticated or malformed).
+
+```json
+{"ts":"2026-10-29T09:12:44.913+00:00","event":"mcp_gateway.decision","decision":"deny","reason":"admin_tool_requires_admin_role","request_id":"5f0c...","subject":"alice","role":"viewer","http_method":"POST","method":"tools/call","rpc_id":7,"tool":"admin_reset_key","status":200,"code":-32001}
+```
+
+The token is never logged. Client-supplied strings are JSON-escaped and truncated, so a tool name
+containing a newline cannot forge a second line. The `request_id` is also sent downstream as
+`X-Gateway-Request-Id` for correlation.
+
 ## Proxying
 
 | Client request | Gateway behaviour |

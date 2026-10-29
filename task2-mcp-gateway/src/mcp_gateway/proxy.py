@@ -5,6 +5,9 @@ The gateway exposes one endpoint, `/mcp`, and relays it to one downstream URL:
 - POST carries a JSON-RPC message. The downstream answers with `application/json` or with a
   `text/event-stream`, and either is relayed to the client chunk by chunk, never buffered.
 - GET opens the server-to-client SSE stream, DELETE terminates a session.
+
+Every request is authenticated first. A POST body is then parsed, checked against the policy, and
+either answered by the gateway (error or denial) or forwarded in canonical form.
 """
 
 from __future__ import annotations
@@ -12,8 +15,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+import uuid
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 
 import anyio
 import httpx
@@ -23,21 +28,26 @@ from starlette.responses import Response
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
-from mcp_gateway.auth import AuthenticationError, Identity, TokenVerifier, bearer_token
+from mcp_gateway.audit import AuditRecord
+from mcp_gateway.auth import AuthenticationError, Identity, Role, TokenVerifier, bearer_token
 from mcp_gateway.config import GatewaySettings
 from mcp_gateway.jsonrpc import (
     AUTHENTICATION_FAILED,
     DOWNSTREAM_TIMEOUT,
     DOWNSTREAM_UNAVAILABLE,
     INVALID_REQUEST,
+    UNAUTHORIZED_TOOL_CALL,
     JsonRpcError,
     RequestId,
+    parse_message,
 )
+from mcp_gateway.policy import authorize, check_routing_headers
 
 logger = logging.getLogger("mcp_gateway.proxy")
 
 MCP_PATH = "/mcp"
 ALLOWED_METHODS = ("GET", "POST", "DELETE")
+_BODYLESS_REASONS = {"GET": "sse_stream", "DELETE": "session_termination"}
 
 RawHeaders = list[tuple[bytes, bytes]]
 
@@ -60,6 +70,7 @@ HOP_BY_HOP_HEADERS = frozenset(
 IDENTITY_HEADER_PREFIX = "x-gateway-"
 SUBJECT_HEADER = "x-gateway-subject"
 ROLE_HEADER = "x-gateway-role"
+REQUEST_ID_HEADER = "x-gateway-request-id"
 
 # - host and content-length are recomputed for the downstream request.
 # - accept-encoding is replaced by "identity": a compressor would buffer SSE events.
@@ -181,8 +192,17 @@ class StreamedResponse(Response):
         scope.cancel()
 
 
+@dataclass(frozen=True)
+class Admitted:
+    """A request the gateway decided to forward."""
+
+    content: bytes | None
+    rpc_id: RequestId | None
+    reason: str
+
+
 class Gateway:
-    """The `/mcp` endpoint (an ASGI app): authenticates, validates, then forwards downstream."""
+    """The `/mcp` endpoint (an ASGI app): authenticates, validates, authorizes, forwards."""
 
     def __init__(self, settings: GatewaySettings, client: httpx.AsyncClient) -> None:
         self.settings = settings
@@ -205,18 +225,20 @@ class Gateway:
         await response(scope, receive, send)
 
     async def handle(self, request: Request) -> Response:
+        """Admit or refuse the request (one audit line either way), then forward it."""
+        record = AuditRecord(request_id=uuid.uuid4().hex, http_method=request.method)
         try:
             identity = self.authenticate(request)
-            if request.method == "POST":
-                return await self._handle_post(request, identity)
-            if request.method in ALLOWED_METHODS:
-                return await self.forward(request, identity, content=None)
-            raise JsonRpcError(
-                INVALID_REQUEST,
-                f"HTTP method {request.method} is not supported",
-                http_status=405,
-                headers={"Allow": ", ".join(ALLOWED_METHODS)},
-            )
+            record.subject, record.role = identity.subject, identity.role.value
+            admitted = await self._admit(request, identity.role, record)
+        except JsonRpcError as error:
+            verdict = "deny" if error.code == UNAUTHORIZED_TOOL_CALL else "reject"
+            record.emit(verdict, error.detail or error.message, status=error.http_status, code=error.code)
+            return error_response(error)
+
+        record.emit("allow", admitted.reason)
+        try:
+            return await self.forward(request, identity, record.request_id, admitted)
         except JsonRpcError as error:
             return error_response(error)
 
@@ -225,34 +247,67 @@ class Gateway:
         try:
             return self._verifier.verify(bearer_token(request.headers.getlist("authorization")))
         except AuthenticationError as exc:
-            logger.info("authentication failed: %s", exc.reason)
             raise JsonRpcError(
                 AUTHENTICATION_FAILED,
                 exc.description,
                 http_status=exc.http_status,
                 headers={"WWW-Authenticate": exc.www_authenticate},
+                detail=f"authentication failed: {exc.reason}",
             ) from exc
 
-    async def _handle_post(self, request: Request, identity: Identity) -> Response:
+    async def _admit(self, request: Request, role: Role, record: AuditRecord) -> Admitted:
+        """Validate the request and apply the policy. Raises `JsonRpcError` to refuse it."""
+        if request.method in _BODYLESS_REASONS:  # no JSON-RPC message, nothing to authorize
+            return Admitted(content=None, rpc_id=None, reason=_BODYLESS_REASONS[request.method])
+        if request.method != "POST":
+            raise JsonRpcError(
+                INVALID_REQUEST,
+                f"HTTP method {request.method} is not supported",
+                http_status=405,
+                headers={"Allow": ", ".join(ALLOWED_METHODS)},
+            )
         check_content_type(request.headers.get("content-type"))
-        body = await read_body(request, self.settings.max_body_bytes)
-        return await self.forward(request, identity, content=body)
+        message = parse_message(await read_body(request, self.settings.max_body_bytes))
+        record.method, record.rpc_id = message.method, message.id
+        headers = [(name.decode("latin-1"), value.decode("latin-1")) for name, value in request.headers.raw]
+        check_routing_headers(message, headers)
+
+        decision = authorize(message, role)
+        record.tool = decision.tool
+        rpc_id = message.id if message.method is not None else None  # a client response is not a request
+        if not decision.allowed:
+            # HTTP 200: the exchange itself worked, and MCP clients surface a JSON-RPC error for
+            # this one call (the official SDK raises MCPError(-32001)). A 401/403 would instead
+            # look like a broken session or trigger a token refresh.
+            raise JsonRpcError(
+                UNAUTHORIZED_TOOL_CALL,
+                "Unauthorized Tool Call",
+                http_status=200,
+                rpc_id=rpc_id,
+                data={"requiredRole": Role.ADMIN.value},
+                detail=decision.reason,
+            )
+        # Forward the canonical bytes, not the received ones: the downstream must see exactly the
+        # message that was authorized.
+        return Admitted(content=message.canonical, rpc_id=rpc_id, reason=decision.reason)
 
     async def forward(
-        self, request: Request, identity: Identity, *, content: bytes | None, rpc_id: RequestId | None = None
+        self, request: Request, identity: Identity, request_id: str, admitted: Admitted
     ) -> Response:
         """Send the request downstream and relay the response; transport failures become 502/504."""
+        rpc_id = admitted.rpc_id
         headers = filter_headers(request.headers.raw, DROPPED_REQUEST_HEADERS, IDENTITY_HEADER_PREFIX)
         headers += [
             (b"accept-encoding", b"identity"),
             (SUBJECT_HEADER.encode(), identity.subject.encode()),
             (ROLE_HEADER.encode(), identity.role.value.encode()),
+            (REQUEST_ID_HEADER.encode(), request_id.encode()),
         ]
         upstream_request = self._client.build_request(
             request.method,
             self.settings.downstream_url,
             headers=headers,
-            content=content,
+            content=admitted.content,  # httpx sets Content-Length from these bytes
             timeout=self._stream_timeout if request.method == "GET" else self._timeout,
         )
         try:
