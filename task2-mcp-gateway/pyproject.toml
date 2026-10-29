@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quilr-mcp-gateway"
+version = "0.1.0"
+description = "MCP security gateway: streaming JSON-RPC reverse proxy with Bearer auth and admin_* tool authorization"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "anyio>=4.5",
+  "httpx>=0.28,<1",
+  "mcp>=2.3,<3",
+  "PyJWT>=2.10,<3",
+  "starlette>=0.46,<2",
+  "uvicorn>=0.30",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "hypothesis>=6.100"]
+
+[project.scripts]
+mcp-gateway = "mcp_gateway.__main__:main"
+mcp-gateway-token = "mcp_gateway.token_cli:main"
+mock-mcp-server = "mcp_gateway.mock_mcp_server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
