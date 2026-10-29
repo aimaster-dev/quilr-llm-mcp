@@ -21,6 +21,8 @@ def configure_logging(level: str | None = None) -> None:
     root.handlers[:] = [handler]
     root.setLevel(resolved)
     logging.captureWarnings(True)
+    # httpx logs every downstream request at INFO; uvicorn's access log already covers that.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
     # Audit lines are complete JSON documents (they carry their own timestamp), one per line, so
     # a log shipper can parse them without a format-specific pattern. They are always on: the

@@ -262,7 +262,7 @@ class Gateway:
         if request.method != "POST":
             raise JsonRpcError(
                 INVALID_REQUEST,
-                f"HTTP method {request.method} is not supported",
+                "HTTP method not allowed",
                 http_status=405,
                 headers={"Allow": ", ".join(ALLOWED_METHODS)},
             )

@@ -147,9 +147,11 @@ def parse_message(body: bytes) -> Message:
         # Strict encoding rejects lone surrogates ("\ud800"), which other parsers replace or drop.
         canonical_bytes = canonical.encode("utf-8")
     except _DuplicateKeyError as exc:
-        raise JsonRpcError(PARSE_ERROR, "Parse error: duplicate object key", detail=repr(exc)[:200]) from exc
+        detail = f"duplicate object key {exc.args[0]!r}"[:200]
+        raise JsonRpcError(PARSE_ERROR, "Parse error: duplicate object key", detail=detail) from exc
     except (ValueError, RecursionError) as exc:  # includes JSONDecodeError and UnicodeError
-        raise JsonRpcError(PARSE_ERROR, "Parse error", detail=repr(exc)[:200]) from exc
+        detail = f"{type(exc).__name__}: {exc}"[:200]
+        raise JsonRpcError(PARSE_ERROR, "Parse error", detail=detail) from exc
 
     if isinstance(payload, list):
         # MCP 2025-06-18 removed JSON-RPC batching. Accepting it would mean authorizing every

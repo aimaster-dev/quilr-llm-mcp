@@ -1,16 +1,20 @@
-"""Test doubles: an in-memory downstream that records every request it receives, and tokens."""
+"""Test doubles (an in-memory downstream that records every request it receives), tokens, servers."""
 
 from __future__ import annotations
 
 import inspect
 import json
-from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+import threading
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from typing import Any
 
 import anyio
 import httpx
+import uvicorn
 from starlette.applications import Starlette
+from starlette.types import ASGIApp
 
 from mcp_gateway.auth import Role, mint_token
 from mcp_gateway.config import DEFAULT_JWT_AUDIENCE, DEFAULT_JWT_ISSUER, GatewaySettings
@@ -142,3 +146,25 @@ def asgi_scope(method: str, headers: list[tuple[bytes, bytes]], role: Role = Rol
         "client": ("127.0.0.1", 50000),
         "server": ("gateway.test", 80),
     }
+
+
+@contextmanager
+def serve_in_thread(app: ASGIApp) -> Iterator[str]:
+    """Serve `app` with uvicorn on an ephemeral localhost port in a background thread; yield its URL."""
+    config = uvicorn.Config(
+        app, host="127.0.0.1", port=0, log_config=None, log_level="warning", timeout_graceful_shutdown=2
+    )
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, name="uvicorn-test-server", daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 10
+        while not server.started:
+            if not thread.is_alive() or time.monotonic() > deadline:
+                raise RuntimeError("uvicorn did not start")
+            time.sleep(0.01)
+        port = server.servers[0].sockets[0].getsockname()[1]
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
