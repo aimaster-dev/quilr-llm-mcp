@@ -1,3 +1,9 @@
-# Installs every task package (editable) plus its dev/test extras into one environment:
+# Installs every task project (editable) plus its dev/test extras into one environment.
+# Run from the repository root (the paths below are relative to the current directory):
 #   python -m venv .venv
 #   .venv/bin/pip install -r requirements-dev.txt      (Windows: .venv\Scripts\pip)
+-e ./task1-mcp-server[dev]
+-e ./task2-mcp-gateway[dev]
+-e ./task3-llm-stream-guardrail[dev]
+-e ./task4-llm-router[dev]
+ruff==0.17.3
