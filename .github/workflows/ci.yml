@@ -65,3 +65,19 @@ jobs:
           cache-dependency-path: ${{ matrix.project }}/pyproject.toml
       - run: python -m pip install -e ".[dev]"
       - run: python -m pytest -q
+
+  # The one check branch protection requires. The test matrix has dynamic job names, so requiring
+  # them one by one cannot work; this job fails if any job it depends on failed or was cancelled.
+  ci-passed:
+    name: CI passed
+    if: always()
+    needs: [lint, discover, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check every job's result
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "${RESULTS}" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          # "skipped" is only possible for `test`, when discovery found no projects.
+          echo "${RESULTS}" | jq -e 'all(.[]; .result == "success" or .result == "skipped")' > /dev/null
