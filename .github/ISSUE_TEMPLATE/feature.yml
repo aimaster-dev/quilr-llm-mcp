@@ -1,0 +1,31 @@
+name: Feature / task work item
+description: A scoped unit of work for one of the assessment tasks
+labels: [enhancement]
+body:
+  - type: dropdown
+    id: task
+    attributes:
+      label: Task
+      options:
+        - "Task 1: Customer MCP server"
+        - "Task 2: MCP security gateway"
+        - "Task 3: Streaming PII guardrail"
+        - "Task 4: Rate limiting & fallback router"
+        - Repository / tooling
+    validations:
+      required: true
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What should exist when this is done, and why?
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Concrete, testable checks.
+      placeholder: "- [ ] ..."
+    validations:
+      required: true

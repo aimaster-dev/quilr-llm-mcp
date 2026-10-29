@@ -1,0 +1,16 @@
+line-length = 110
+target-version = "py312"
+
+[lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "ASYNC", "RUF", "S"]
+ignore = [
+  "S101", # asserts are fine in tests and for internal invariants
+  "S104", # binding to 0.0.0.0 is an explicit, documented CLI option
+]
+
+[lint.per-file-ignores]
+"**/tests/**" = ["S105", "S106", "S108", "S311", "S603", "ASYNC"]
+"**/benchmarks/**" = ["S311"]
+
+[lint.isort]
+known-first-party = ["customer_mcp", "mcp_gateway", "stream_guardrail", "llm_router"]

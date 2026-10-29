@@ -1,0 +1,3 @@
+# Installs every task package (editable) plus its dev/test extras into one environment:
+#   python -m venv .venv
+#   .venv/bin/pip install -r requirements-dev.txt      (Windows: .venv\Scripts\pip)
