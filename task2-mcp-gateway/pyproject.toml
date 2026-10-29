@@ -11,6 +11,7 @@ requires-python = ">=3.12"
 dependencies = [
   "anyio>=4.5",
   "httpx>=0.28,<1",
+  "PyJWT>=2.10,<3",
   "starlette>=0.46,<2",
   "uvicorn>=0.30",
 ]
@@ -20,6 +21,7 @@ dev = ["pytest>=8"]
 
 [project.scripts]
 mcp-gateway = "mcp_gateway.__main__:main"
+mcp-gateway-token = "mcp_gateway.token_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

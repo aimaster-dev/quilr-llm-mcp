@@ -10,7 +10,15 @@ from collections.abc import Sequence
 import uvicorn
 
 from mcp_gateway import GATEWAY_NAME, __version__
-from mcp_gateway.config import DEFAULT_DOWNSTREAM_URL, DEFAULT_MAX_BODY_BYTES, ConfigError, GatewaySettings
+from mcp_gateway.config import (
+    DEFAULT_DOWNSTREAM_URL,
+    DEFAULT_JWT_AUDIENCE,
+    DEFAULT_JWT_ISSUER,
+    DEFAULT_MAX_BODY_BYTES,
+    JWT_SECRET_ENV,
+    ConfigError,
+    GatewaySettings,
+)
 from mcp_gateway.logging_config import configure_logging
 from mcp_gateway.proxy import MCP_PATH, create_app
 
@@ -57,7 +65,26 @@ def build_parser() -> argparse.ArgumentParser:
         default=_env("MAX_BODY_BYTES", str(DEFAULT_MAX_BODY_BYTES)),
         help="largest accepted request body (default: %(default)s)",
     )
+    parser.add_argument(
+        "--jwt-issuer",
+        default=_env("JWT_ISSUER", DEFAULT_JWT_ISSUER),
+        help="required `iss` claim (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--jwt-audience",
+        default=_env("JWT_AUDIENCE", DEFAULT_JWT_AUDIENCE),
+        help="required `aud` claim (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--jwt-leeway",
+        type=float,
+        default=_env("JWT_LEEWAY", "30"),
+        help="clock skew tolerated on exp/nbf/iat, in seconds (default: %(default)s)",
+    )
     parser.add_argument("--log-level", default=None, help="DEBUG, INFO, WARNING or ERROR (default: INFO)")
+    parser.epilog = (
+        f"The HS256 token secret is read from ${JWT_SECRET_ENV} only (at least 32 bytes), never from a flag."
+    )
     return parser
 
 
@@ -67,6 +94,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     configure_logging(args.log_level)
     try:
         settings = GatewaySettings(
+            jwt_secret=os.environ.get(JWT_SECRET_ENV, ""),
+            jwt_issuer=args.jwt_issuer,
+            jwt_audience=args.jwt_audience,
+            jwt_leeway=args.jwt_leeway,
             downstream_url=args.downstream_url,
             connect_timeout=args.connect_timeout,
             read_timeout=args.read_timeout,

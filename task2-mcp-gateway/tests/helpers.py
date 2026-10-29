@@ -1,4 +1,4 @@
-"""Test doubles: an in-memory downstream that records every request it receives."""
+"""Test doubles: an in-memory downstream that records every request it receives, and tokens."""
 
 from __future__ import annotations
 
@@ -12,13 +12,32 @@ import anyio
 import httpx
 from starlette.applications import Starlette
 
-from mcp_gateway.config import GatewaySettings
+from mcp_gateway.auth import Role, mint_token
+from mcp_gateway.config import DEFAULT_JWT_AUDIENCE, DEFAULT_JWT_ISSUER, GatewaySettings
 from mcp_gateway.proxy import create_app
 
 DOWNSTREAM_URL = "http://downstream.test/mcp"
 SSE_HEADERS = {"content-type": "text/event-stream", "cache-control": "no-cache"}
+TEST_SECRET = "test-only-secret-" + "0123456789abcdef" * 4
 
 Responder = Callable[[httpx.Request], httpx.Response | Awaitable[httpx.Response]]
+
+
+def token_for(role: Role | str, subject: str = "alice", **overrides: Any) -> str:
+    """A valid token for the test gateway; `overrides` replace mint_token arguments."""
+    arguments: dict[str, Any] = {
+        "secret": TEST_SECRET,
+        "subject": subject,
+        "role": Role(role),
+        "issuer": DEFAULT_JWT_ISSUER,
+        "audience": DEFAULT_JWT_AUDIENCE,
+        **overrides,
+    }
+    return mint_token(**arguments)
+
+
+def bearer(role: Role | str, subject: str = "alice") -> dict[str, str]:
+    return {"Authorization": f"Bearer {token_for(role, subject)}"}
 
 
 def jsonrpc_echo(request: httpx.Request) -> httpx.Response:
@@ -82,23 +101,33 @@ class ScriptedStream(httpx.AsyncByteStream):
 
 def make_app(downstream: Downstream, **settings: Any) -> Starlette:
     return create_app(
-        GatewaySettings(downstream_url=DOWNSTREAM_URL, **settings), transport=downstream.transport
+        GatewaySettings(jwt_secret=TEST_SECRET, downstream_url=DOWNSTREAM_URL, **settings),
+        transport=downstream.transport,
     )
 
 
 @asynccontextmanager
-async def gateway_client(downstream: Downstream, **settings: Any) -> AsyncIterator[httpx.AsyncClient]:
-    """An HTTP client wired to an in-memory gateway, which is wired to `downstream`."""
+async def gateway_client(
+    downstream: Downstream, *, role: Role | str | None = Role.VIEWER, **settings: Any
+) -> AsyncIterator[httpx.AsyncClient]:
+    """An HTTP client wired to an in-memory gateway, which is wired to `downstream`.
+
+    The client authenticates as `role` (subject "alice") unless `role` is None.
+    """
     app = make_app(downstream, **settings)
+    headers = bearer(role) if role is not None else {}
     async with (
         app.router.lifespan_context(app),
-        httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://gateway.test") as client,
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app), base_url="http://gateway.test", headers=headers
+        ) as client,
     ):
         yield client
 
 
-def asgi_scope(method: str, headers: list[tuple[bytes, bytes]]) -> dict[str, Any]:
+def asgi_scope(method: str, headers: list[tuple[bytes, bytes]], role: Role = Role.VIEWER) -> dict[str, Any]:
     """A raw ASGI HTTP scope for `/mcp`, for tests that drive the app message by message."""
+    authorization = (b"authorization", f"Bearer {token_for(role)}".encode())
     return {
         "type": "http",
         "asgi": {"version": "3.0", "spec_version": "2.4"},
@@ -109,7 +138,7 @@ def asgi_scope(method: str, headers: list[tuple[bytes, bytes]]) -> dict[str, Any
         "raw_path": b"/mcp",
         "query_string": b"",
         "root_path": "",
-        "headers": [(b"host", b"gateway.test"), *headers],
+        "headers": [(b"host", b"gateway.test"), authorization, *headers],
         "client": ("127.0.0.1", 50000),
         "server": ("gateway.test", 80),
     }

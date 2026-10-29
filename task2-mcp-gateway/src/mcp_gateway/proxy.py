@@ -23,8 +23,10 @@ from starlette.responses import Response
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
+from mcp_gateway.auth import AuthenticationError, Identity, TokenVerifier, bearer_token
 from mcp_gateway.config import GatewaySettings
 from mcp_gateway.jsonrpc import (
+    AUTHENTICATION_FAILED,
     DOWNSTREAM_TIMEOUT,
     DOWNSTREAM_UNAVAILABLE,
     INVALID_REQUEST,
@@ -53,17 +55,34 @@ HOP_BY_HOP_HEADERS = frozenset(
         "upgrade",
     }
 )
-# host and content-length are recomputed for the downstream request. accept-encoding is replaced by
-# "identity" so the downstream never compresses an SSE stream (a compressor buffers events).
-DROPPED_REQUEST_HEADERS = HOP_BY_HOP_HEADERS | {"host", "content-length", "expect", "accept-encoding"}
+# Identity the gateway asserts to the downstream. Client-supplied headers with this prefix are
+# dropped, so only the gateway can set them.
+IDENTITY_HEADER_PREFIX = "x-gateway-"
+SUBJECT_HEADER = "x-gateway-subject"
+ROLE_HEADER = "x-gateway-role"
+
+# - host and content-length are recomputed for the downstream request.
+# - accept-encoding is replaced by "identity": a compressor would buffer SSE events.
+# - The client's credentials stay at the gateway. Forwarding its token would make the downstream
+#   accept a token that was not issued for it (the MCP spec forbids token passthrough).
+DROPPED_REQUEST_HEADERS = HOP_BY_HOP_HEADERS | {
+    "host",
+    "content-length",
+    "expect",
+    "accept-encoding",
+    "authorization",
+    "cookie",
+}
 # The ASGI server sets its own date/server headers; the downstream's would duplicate them.
 DROPPED_RESPONSE_HEADERS = HOP_BY_HOP_HEADERS | {"date", "server"}
 
 _CONTENT_LENGTH = re.compile(r"[0-9]{1,19}")
 
 
-def filter_headers(raw: Iterable[tuple[bytes, bytes]], drop: frozenset[str]) -> RawHeaders:
-    """Copy headers (lower-cased names) minus `drop` and any header nominated by `Connection`."""
+def filter_headers(
+    raw: Iterable[tuple[bytes, bytes]], drop: frozenset[str], drop_prefix: str | None = None
+) -> RawHeaders:
+    """Copy headers (lower-cased names) minus `drop`, `drop_prefix*` and those named by `Connection`."""
     headers = [(name.lower(), value) for name, value in raw]
     nominated = {
         token.strip().lower()
@@ -74,7 +93,9 @@ def filter_headers(raw: Iterable[tuple[bytes, bytes]], drop: frozenset[str]) -> 
     return [
         (name, value)
         for name, value in headers
-        if (key := name.decode("latin-1")) not in drop and key not in nominated
+        if (key := name.decode("latin-1")) not in drop
+        and key not in nominated
+        and not (drop_prefix and key.startswith(drop_prefix))
     ]
 
 
@@ -161,11 +182,17 @@ class StreamedResponse(Response):
 
 
 class Gateway:
-    """The `/mcp` endpoint (an ASGI app): validates the HTTP envelope, then forwards downstream."""
+    """The `/mcp` endpoint (an ASGI app): authenticates, validates, then forwards downstream."""
 
     def __init__(self, settings: GatewaySettings, client: httpx.AsyncClient) -> None:
         self.settings = settings
         self._client = client
+        self._verifier = TokenVerifier(
+            secret=settings.jwt_secret,
+            issuer=settings.jwt_issuer,
+            audience=settings.jwt_audience,
+            leeway=settings.jwt_leeway,
+        )
         connect, read = settings.connect_timeout, settings.read_timeout
         self._timeout = httpx.Timeout(connect=connect, read=read, write=read, pool=connect)
         # GET is a long-lived server-to-client stream: silence on it is normal, not a failure.
@@ -179,10 +206,11 @@ class Gateway:
 
     async def handle(self, request: Request) -> Response:
         try:
+            identity = self.authenticate(request)
             if request.method == "POST":
-                return await self._handle_post(request)
+                return await self._handle_post(request, identity)
             if request.method in ALLOWED_METHODS:
-                return await self.forward(request, content=None)
+                return await self.forward(request, identity, content=None)
             raise JsonRpcError(
                 INVALID_REQUEST,
                 f"HTTP method {request.method} is not supported",
@@ -192,17 +220,34 @@ class Gateway:
         except JsonRpcError as error:
             return error_response(error)
 
-    async def _handle_post(self, request: Request) -> Response:
+    def authenticate(self, request: Request) -> Identity:
+        """Verify the bearer token, before anything else about the request is looked at."""
+        try:
+            return self._verifier.verify(bearer_token(request.headers.getlist("authorization")))
+        except AuthenticationError as exc:
+            logger.info("authentication failed: %s", exc.reason)
+            raise JsonRpcError(
+                AUTHENTICATION_FAILED,
+                exc.description,
+                http_status=exc.http_status,
+                headers={"WWW-Authenticate": exc.www_authenticate},
+            ) from exc
+
+    async def _handle_post(self, request: Request, identity: Identity) -> Response:
         check_content_type(request.headers.get("content-type"))
         body = await read_body(request, self.settings.max_body_bytes)
-        return await self.forward(request, content=body)
+        return await self.forward(request, identity, content=body)
 
     async def forward(
-        self, request: Request, *, content: bytes | None, rpc_id: RequestId | None = None
+        self, request: Request, identity: Identity, *, content: bytes | None, rpc_id: RequestId | None = None
     ) -> Response:
         """Send the request downstream and relay the response; transport failures become 502/504."""
-        headers = filter_headers(request.headers.raw, DROPPED_REQUEST_HEADERS)
-        headers.append((b"accept-encoding", b"identity"))
+        headers = filter_headers(request.headers.raw, DROPPED_REQUEST_HEADERS, IDENTITY_HEADER_PREFIX)
+        headers += [
+            (b"accept-encoding", b"identity"),
+            (SUBJECT_HEADER.encode(), identity.subject.encode()),
+            (ROLE_HEADER.encode(), identity.role.value.encode()),
+        ]
         upstream_request = self._client.build_request(
             request.method,
             self.settings.downstream_url,
