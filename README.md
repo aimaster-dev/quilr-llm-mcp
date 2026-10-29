@@ -35,4 +35,5 @@ cd task1-mcp-server && pytest
 - **Commits**: [Conventional Commits](https://www.conventionalcommits.org/) with a task scope,
   e.g. `feat(task2): reject admin_* tool calls for non-admin roles`, each referencing its issue.
 - **CI**: GitHub Actions runs `ruff` and each task's `pytest` suite on Ubuntu and Windows.
-  New `task*/` projects are picked up automatically.
+  New `task*/` projects are picked up automatically. A final `CI passed` job fails if any other
+  job failed, and it is the single status check that branch protection on `main` requires.
