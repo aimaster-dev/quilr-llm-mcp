@@ -8,10 +8,18 @@ version = "0.1.0"
 description = "Streaming PII guardrail for LLM responses: incremental redaction across chunk boundaries"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+  "starlette>=0.40",
+  "httpx>=0.27",
+  "uvicorn>=0.30",
+  "anyio>=4.4",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "hypothesis>=6.100"]
+
+[project.scripts]
+stream-guardrail = "stream_guardrail.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
