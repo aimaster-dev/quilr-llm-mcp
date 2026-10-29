@@ -9,6 +9,8 @@ from mcp.server import Server, ServerRequestContext
 
 from customer_mcp import SERVER_NAME, __version__
 from customer_mcp.registry import ToolRegistry
+from customer_mcp.store import CustomerStore
+from customer_mcp.tools import customer_tools
 
 INSTRUCTIONS = (
     "Customer-service tools. Look customers up by ID (format CUST-XXXXX, five digits) before "
@@ -37,6 +39,6 @@ def build_server(registry: ToolRegistry) -> Server[Any]:
     )
 
 
-def create_server() -> Server[Any]:
-    """Build the production server. Customer tools are registered in `customer_mcp.tools`."""
-    return build_server(ToolRegistry())
+def create_server(store: CustomerStore | None = None) -> Server[Any]:
+    """Build the server with the customer tools, backed by the seeded in-memory store by default."""
+    return build_server(ToolRegistry(customer_tools(store or CustomerStore.with_seed_data())))

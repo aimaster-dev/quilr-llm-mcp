@@ -15,9 +15,11 @@ from typing import Any
 
 import mcp_types as types
 from mcp.shared.exceptions import MCPError
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 logger = logging.getLogger(__name__)
+
+MAX_REPORTED_ERRORS = 20
 
 ToolHandler = Callable[[Any], Awaitable[BaseModel]]
 
@@ -51,7 +53,7 @@ class ToolSpec:
             title=self.title,
             description=self.description,
             input_schema=self.input_model.model_json_schema(),
-            output_schema=self.output_model.model_json_schema(),
+            output_schema=self.output_model.model_json_schema(mode="serialization"),
             annotations=self.annotations,
         )
 
@@ -76,7 +78,15 @@ class ToolRegistry:
             # MCP spec: unknown tools are a protocol error with code -32602.
             raise MCPError(code=types.INVALID_PARAMS, message="Unknown tool", data={"tool": name[:128]})
 
-        params = spec.input_model.model_validate(dict(arguments or {}))
+        try:
+            params = spec.input_model.model_validate(dict(arguments or {}))
+        except ValidationError as exc:
+            # Standard JSON-RPC "Invalid params" with machine-readable, field-level details.
+            raise MCPError(
+                code=types.INVALID_PARAMS,
+                message=f"Invalid arguments for tool '{name}'",
+                data={"tool": name, "errors": describe_validation_errors(exc)},
+            ) from None
         try:
             output = await spec.handler(params)
         except ToolExecutionError as exc:
@@ -88,6 +98,21 @@ class ToolRegistry:
             content=[types.TextContent(text=json.dumps(structured, separators=(",", ":")))],
             structured_content=structured,
         )
+
+
+def describe_validation_errors(exc: ValidationError) -> list[dict[str, str]]:
+    """Summarise a ValidationError without echoing the caller's input values back.
+
+    Inputs can contain sensitive data (and arbitrarily large payloads), so only the field path,
+    the error type and Pydantic's generic message are returned.
+    """
+    details: list[dict[str, str]] = []
+    for error in exc.errors(include_url=False, include_input=False, include_context=False):
+        field = ".".join(str(part) for part in error["loc"]) or "(root)"
+        details.append({"field": field[:64], "type": error["type"], "message": error["msg"]})
+        if len(details) >= MAX_REPORTED_ERRORS:
+            break
+    return details
 
 
 def _error_result(code: str, message: str) -> types.CallToolResult:
