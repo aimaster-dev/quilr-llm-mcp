@@ -192,8 +192,12 @@ class Completion:
 
 
 def _snippet(raw: bytes) -> str:
+    """A bounded, escaped excerpt of an upstream body for the logs.
+
+    repr() escapes newlines and control characters, so an upstream cannot forge extra log lines.
+    """
     text = raw[:_LOG_BODY_LIMIT].decode("utf-8", errors="replace")
-    return text + ("..." if len(raw) > _LOG_BODY_LIMIT else "")
+    return repr(text) + ("..." if len(raw) > _LOG_BODY_LIMIT else "")
 
 
 class ModelRouter:
@@ -227,6 +231,9 @@ class ModelRouter:
                 ),
                 transport=transports.get(upstream.label),
                 follow_redirects=False,
+                # Egress is explicit configuration: ambient proxy variables must not be able to
+                # route provider traffic (and provider API keys) somewhere else.
+                trust_env=False,
             )
             for upstream in (primary, secondary)
             if upstream is not None

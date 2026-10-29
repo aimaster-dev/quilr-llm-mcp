@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from llm_router.keys import fingerprint_api_key, is_fingerprint
+from llm_router.keys import TenantKeyring, fingerprint_api_key, is_fingerprint
 from llm_router.tokens import (
     MESSAGE_OVERHEAD_TOKENS,
     REPLY_PRIMING_TOKENS,
@@ -50,3 +50,15 @@ def test_fingerprints() -> None:
     assert fp != fingerprint_api_key("sk-test2")
     assert not is_fingerprint("sk-test")
     assert not is_fingerprint(fp.upper())
+
+
+def test_keyring_matches_bearer_tokens_by_fingerprint() -> None:
+    keyring = TenantKeyring([fingerprint_api_key("key-a"), fingerprint_api_key("key-b").upper()])
+    assert len(keyring) == 2
+    assert keyring.authenticate("key-a") == fingerprint_api_key("key-a")
+    assert keyring.authenticate_header("Bearer key-b") == fingerprint_api_key("key-b")
+    assert keyring.authenticate_header("bearer   key-b ") == fingerprint_api_key("key-b")
+    for header in (None, "", "Bearer", "Basic key-a", "Bearer key-c", "Bearer " + "k" * 600):
+        assert keyring.authenticate_header(header) is None
+    with pytest.raises(ValueError, match="fingerprint"):
+        TenantKeyring(["key-a"])

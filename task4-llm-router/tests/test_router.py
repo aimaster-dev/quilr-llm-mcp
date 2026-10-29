@@ -104,6 +104,15 @@ async def test_healthy_primary_never_touches_the_secondary() -> None:
     assert primary.requests[0].headers["x-request-id"] == "req_test"
 
 
+async def test_logged_upstream_bodies_are_bounded_and_escaped() -> None:
+    body = "first line\n2026-01-01 INFO forged log line\r\n" + "x" * 5_000
+    error = await fail(make_router(Recorder(respond(500, text=body)), None))
+    detail = error.failures[-1].detail
+    assert "\n" not in detail and "\r" not in detail
+    assert "forged log line" in detail
+    assert len(detail) < 600
+
+
 async def test_only_whitelisted_response_fields_are_kept() -> None:
     body = completion_body(
         "hi", system_fingerprint="fp_internal", x_provider_debug={"host": "gpu-7.internal"}
@@ -182,9 +191,9 @@ async def test_a_late_primary_response_is_cancelled_never_used() -> None:
 
 
 async def test_slow_drip_body_cannot_evade_the_deadline() -> None:
-    # Headers arrive at once and a byte every 20 ms never trips a per-read timeout, but the body
-    # would take 4 s in total. The attempt deadline covers the body, so it still fails over.
-    stream = DripStream(chunks=200, interval=0.02)
+    # Headers arrive at once and a byte every 50 ms never trips a per-read timeout, but the body
+    # would take 5 s in total. The attempt deadline covers the body, so it still fails over.
+    stream = DripStream(chunks=100, interval=0.05)
     secondary = Recorder(ok("from secondary"))
     started = anyio.current_time()
     completion = await run(make_router(Recorder(drip(stream)), secondary))
