@@ -35,7 +35,11 @@ jobs:
       - id: find
         shell: bash
         run: |
-          projects=$(for d in task*/; do [ -f "${d}pyproject.toml" ] && echo "${d%/}"; done | jq -R . | jq -cs .)
+          # nullglob: with no task*/ folders the loop must not run on the literal pattern.
+          # if/fi instead of `[ ] && echo`: a folder without pyproject.toml must not end the loop
+          # with status 1, which fails the step under `bash -e -o pipefail`.
+          shopt -s nullglob
+          projects=$(for d in task*/; do if [ -f "${d}pyproject.toml" ]; then echo "${d%/}"; fi; done | jq -R . | jq -cs .)
           echo "Found: ${projects}"
           echo "projects=${projects}" >> "$GITHUB_OUTPUT"
 
