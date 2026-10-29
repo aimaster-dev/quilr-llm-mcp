@@ -55,6 +55,24 @@ submitted values, which may contain PII or be arbitrarily large.
    {"field":"reason","type":"string_too_short","message":"String should have at least 10 characters"}]}}}
 ```
 
+### JSON-RPC error mapping
+
+| Situation | Code | `id` in the reply |
+|-----------|------|-------------------|
+| Line is not JSON (incl. invalid UTF-8 and the non-standard `NaN` / `Infinity` literals) | `-32700` Parse error | `null` |
+| Batch array (MCP removed JSON-RPC batching) | `-32600` Invalid Request | `null` |
+| JSON but not a valid request: wrong `jsonrpc`, missing/non-string `method`, non-object `params` | `-32600` Invalid Request | echoed if valid |
+| `id` that is not a string or integer (`true`, `null`, `1.5`, ...) | `-32600` Invalid Request | `null` |
+| Unknown method | `-32601` Method not found | echoed |
+| Unknown tool, malformed/missing/extra tool arguments | `-32602` Invalid params | echoed |
+| Unexpected server fault | `-32603` Internal error. The traceback goes to stderr; the wire gets no internals | echoed |
+| Blank line, client response, notification | no reply (JSON-RPC never answers these) | |
+
+The first four rows are handled in `stdio.py` before the SDK sees the line. The SDK's stdin reader
+only *logs* frames it cannot parse, and it reads a request with an invalid `id` as a notification. In
+both cases the client would wait forever for a reply. `check_frame` validates the JSON-RPC envelope
+of every raw line and answers malformed frames itself, so only well-formed messages reach the SDK.
+
 ## Use from an MCP host
 
 ```json
@@ -75,5 +93,24 @@ stdout is the wire, so the server protects it in three layers:
    wire either.
 3. `logging` is configured with a single stderr handler.
 
-The test suite checks this at the byte level: every line the server writes to stdout must parse
-as a JSON-RPC 2.0 message.
+stdin gets the same treatment: the server reads the wire from a private duplicate of fd 0 and points
+fd 0 at the null device. A library or child process that reads stdin gets EOF and cannot consume
+bytes meant for the server.
+
+The test suite checks all of this at the byte level. Every line the server writes to stdout must
+parse as a JSON-RPC 2.0 message, including when a tool handler `print()`s, writes to fd 1 directly
+and spawns a child process that writes to stdout and reads stdin (`tests/noisy_server.py`).
+
+## Tests
+
+```bash
+pytest
+```
+
+| File | Covers |
+|------|--------|
+| `test_schemas.py` | Validation edge cases for every field |
+| `test_tools.py` | Tool behaviour through the SDK client (in-process), incl. concurrent refunds |
+| `test_frames.py` | Envelope validation of raw stdin lines |
+| `test_protocol_errors.py` | Every JSON-RPC error code, asserted on the real binary's stdout |
+| `test_stdio_transport.py` | Handshake, stderr-only logging, stray-output isolation, official SDK client over stdio |

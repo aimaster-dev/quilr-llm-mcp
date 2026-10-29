@@ -92,6 +92,11 @@ class ToolRegistry:
         except ToolExecutionError as exc:
             logger.info("tool %s rejected request: %s", name, exc.code)
             return _error_result(exc.code, exc.message)
+        except Exception:
+            # Unexpected fault: full traceback to stderr, generic -32603 on the wire. Without this
+            # the SDK would answer with code 0 and str(exc), leaking internals to the client.
+            logger.exception("tool %s failed unexpectedly", name)
+            raise MCPError(code=types.INTERNAL_ERROR, message="Internal error") from None
 
         structured = output.model_dump(mode="json")
         return types.CallToolResult(
