@@ -305,6 +305,7 @@ def create_app(
                     settings.primary_upstream(),
                     settings.secondary_upstream(),
                     policy=settings.failover_policy(),
+                    max_response_bytes=settings.max_response_bytes,
                     transports=transports,
                 ) as router,
                 anyio.create_task_group() as tg,

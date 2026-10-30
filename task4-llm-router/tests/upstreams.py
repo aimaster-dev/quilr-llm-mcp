@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import itertools
 import json
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import Any
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from typing import Any, Literal
 
 import anyio
 import httpx
+from anyio.abc import SocketAttribute, SocketStream
 
 Handler = Callable[[httpx.Request], Awaitable[httpx.Response]]
 
@@ -116,3 +121,67 @@ def drip(stream: DripStream) -> Handler:
         return httpx.Response(200, headers={"content-type": "application/json"}, stream=stream)
 
     return handler
+
+
+# -- a real HTTP/1.1 server with scripted connection behaviour -----------------------------------
+
+#: What the server does with one request: answer it, close the connection without sending a byte,
+#: or send the status line and headers and then close mid-body.
+Action = Literal["ok", "close", "headers-then-close"]
+
+
+@dataclass
+class ScriptedServer:
+    """Records ``(connection number, request number on that connection)`` for every request."""
+
+    url: str
+    script: Callable[[int, int], Action]
+    requests: list[tuple[int, int]] = field(default_factory=list)
+    connections: int = 0
+
+
+@asynccontextmanager
+async def scripted_server(script: Callable[[int, int], Action]) -> AsyncIterator[ScriptedServer]:
+    """Serve on 127.0.0.1 (ephemeral port), keeping connections alive until the script says not to.
+
+    Lets tests reproduce, deterministically, a provider closing a keep-alive connection at the
+    moment the gateway reuses it.
+    """
+    listener = await anyio.create_tcp_listener(local_host="127.0.0.1")
+    port = listener.extra(SocketAttribute.local_port)  # noqa: S610 (anyio, not Django)
+    server = ScriptedServer(f"http://127.0.0.1:{port}/v1", script)
+    body = json.dumps(completion_body("from the scripted server")).encode()
+    head = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: %d\r\n\r\n" % len(body)
+
+    async def handle(stream: SocketStream) -> None:
+        connection = server.connections
+        server.connections += 1
+        buffer = b""
+        async with stream:
+            for number in itertools.count():
+                try:
+                    while b"\r\n\r\n" not in buffer:
+                        buffer += await stream.receive()
+                    headers, _, buffer = buffer.partition(b"\r\n\r\n")
+                    length = int(re.search(rb"(?i)content-length:\s*(\d+)", headers).group(1))
+                    while len(buffer) < length:
+                        buffer += await stream.receive()
+                except (anyio.EndOfStream, anyio.BrokenResourceError, OSError):
+                    return  # the client closed the connection
+                buffer = buffer[length:]
+                server.requests.append((connection, number))
+                match server.script(connection, number):
+                    case "close":
+                        return
+                    case "headers-then-close":
+                        await stream.send(head + body[:10])
+                        return
+                    case "ok":
+                        await stream.send(head + body)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(listener.serve, handle)
+        try:
+            yield server
+        finally:
+            tg.cancel_scope.cancel()

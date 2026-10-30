@@ -43,9 +43,13 @@ def test_flags_override_environment() -> None:
 
 
 def test_failover_switches() -> None:
-    settings = load_settings(["--no-failover-on-connection-error", "--no-failover-on-server-error"], BASE_ENV)
-    policy = settings.failover_policy()
-    assert (policy.on_connection_error, policy.on_server_error) == (False, False)
+    defaults = load_settings([], BASE_ENV).failover_policy()
+    assert (defaults.on_connection_error, defaults.on_server_error, defaults.on_refused) == (True, True, True)
+    argv = ["--no-failover-on-connection-error", "--no-failover-on-server-error", "--no-failover-on-refused"]
+    policy = load_settings(argv, BASE_ENV).failover_policy()
+    assert (policy.on_connection_error, policy.on_server_error, policy.on_refused) == (False, False, False)
+    env = {**BASE_ENV, "LLM_ROUTER_FAILOVER_ON_REFUSED": "off"}
+    assert load_settings([], env).failover_policy().on_refused is False
 
 
 def test_tenant_keys_are_kept_only_as_fingerprints() -> None:
@@ -75,6 +79,7 @@ def test_secrets_stay_out_of_repr() -> None:
         (["--secondary-url", "http://b/v1"], BASE_ENV),
         (["--primary-timeout-ms", "0"], BASE_ENV),
         (["--tokens-per-window", "0"], BASE_ENV),
+        (["--max-response-bytes", "100"], BASE_ENV),
         ([], {**BASE_ENV, "LLM_ROUTER_FAILOVER_ON_SERVER_ERROR": "maybe"}),
         ([], {**BASE_ENV, "LLM_ROUTER_TENANT_KEY_SHA256": "not-a-digest"}),
     ],
@@ -97,6 +102,9 @@ def test_environment_round_trip_for_worker_processes(tmp_path: Path) -> None:
         "--db-path",
         str(tmp_path / "x.db"),
         "--no-failover-on-connection-error",
+        "--no-failover-on-refused",
+        "--max-response-bytes",
+        "65536",
         "--workers",
         "4",
     ]

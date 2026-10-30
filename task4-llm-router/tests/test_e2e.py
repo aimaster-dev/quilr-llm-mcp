@@ -155,6 +155,7 @@ async def test_walkthrough_failover_errors_and_rate_limits(tmp_path: Path) -> No
         down = await client.post("/v1/chat/completions", json=chat_body(), headers=auth())
         assert down.status_code == 503
         assert down.json()["error"]["code"] == "upstream_unavailable"
+        assert down.headers["retry-after"] == "1"  # from the primary's 429, sanitized
         for leak in (INTERNAL_HOST, FAKE_SECRET, "Traceback", "primary-mock", "secondary-mock", "127.0.0.1"):
             assert leak not in down.text
 

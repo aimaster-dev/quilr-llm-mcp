@@ -96,7 +96,9 @@ Every flag also reads an `LLM_ROUTER_*` environment variable (`--primary-timeout
 | `--secondary-url`, `--secondary-model` | none | without them there is no failover |
 | `--secondary-timeout-ms` | `30000` | deadline for the secondary attempt |
 | `--[no-]failover-on-connection-error` | on | 429 and timeouts always fail over |
-| `--[no-]failover-on-server-error` | on | 5xx and malformed 2xx bodies |
+| `--[no-]failover-on-server-error` | on | 5xx and malformed or oversized 2xx bodies |
+| `--[no-]failover-on-refused` | on | 4xx other than 400/413/422/429 (401, 403, 404, 408, ...) |
+| `--max-response-bytes` | `4194304` | larger provider bodies are a bad response |
 | `--tokens-per-window`, `--window-seconds` | `50000`, `60` | per tenant API key |
 | `--db-path` | `data/llm_router.db` | must be on a local disk (SQLite locking) |
 | `--sweep-interval` | `30` | seconds between global evictions |
@@ -123,7 +125,7 @@ simple. `model` is echoed back; the gateway decides which provider models serve 
 |-----------------|---------|
 | `X-Request-Id` | on every response; also in error payloads and every log line |
 | `X-RateLimit-Limit` / `X-RateLimit-Remaining` | the tenant's window budget and what is left after this request |
-| `Retry-After` | on 429: whole seconds until enough of the window drains for this request |
+| `Retry-After` | on 429: whole seconds until enough of the window drains for this request; on 503: the smallest sanitized `Retry-After` the providers sent (1-60 s), if any |
 | `X-Gateway-Route` | `primary` or `fallback`: an opaque label, not a provider name |
 
 `GET /healthz` returns `{"status": "ok"}`.
@@ -232,16 +234,35 @@ case, over an in-process stream and over a real socket.
 | Primary outcome | Gateway action | If it is the final outcome |
 |-----------------|----------------|----------------------------|
 | 2xx with a valid completion | return it (`X-Gateway-Route: primary`) | |
-| 429 | fail over | `503 upstream_unavailable` |
+| 429 | fail over | `503 upstream_unavailable` (+ `Retry-After`) |
 | deadline hit (no complete response in 3000 ms) | fail over | `504 upstream_timeout` |
-| connect/read/protocol error | fail over (configurable) | `503 upstream_unavailable` |
-| 5xx | fail over (configurable) | `503 upstream_unavailable` |
-| 2xx with a malformed body | fail over (configurable, with 5xx) | `502 upstream_bad_response` |
-| 400 / 413 / 422 | **no** failover: the secondary would refuse it too | `400 upstream_rejected_request` |
-| other 4xx (401, 403, 404, ...) | **no** failover | `502 upstream_bad_response` (gateway misconfiguration, not the client's fault) |
+| connect/read/protocol error | fail over (`--[no-]failover-on-connection-error`) | `503 upstream_unavailable` |
+| 5xx | fail over (`--[no-]failover-on-server-error`) | `503 upstream_unavailable` (+ `Retry-After` from a 503) |
+| 2xx with a malformed body, or a body over `--max-response-bytes` | fail over (with 5xx) | `502 upstream_bad_response` |
+| 401 / 403 / 404 and any other 4xx not listed below | fail over (`--[no-]failover-on-refused`): bad provider key, wrong model or URL; another provider may serve it | `502 upstream_bad_response` (gateway misconfiguration, not the client's fault) |
+| 408 / 409 / 425 | fail over (`--[no-]failover-on-refused`) | `503 upstream_unavailable` (transient) |
+| 400 / 413 / 422 | **no** failover: the request itself is invalid, the secondary would refuse it too | `400 upstream_rejected_request` |
 
 The secondary gets the same treatment with its own deadline. The error returned is decided by the
 last attempt, and every attempt is logged.
+
+- **Retry-After.** A provider's `Retry-After` on a 429 or 503 (delta-seconds or HTTP-date) is
+  reduced to whole seconds in `[1, 60]`; anything else is dropped. When the gateway answers 503,
+  it sends the smallest value among the providers that sent one: when the first of them expects
+  to be available again. Only that integer is relayed, never the provider's text.
+- **Response size cap.** Provider bodies are read in chunks (after content decoding) up to
+  `--max-response-bytes` (4 MiB). A larger 2xx body is a bad response; the rest is not read, and
+  the connection is dropped instead of being pooled.
+- **Stale keep-alive connections.** A provider closing an idle keep-alive connection can race the
+  gateway reusing it, and the request then fails with a read/protocol error although the provider
+  is healthy. Pooled connections expire after 2 s, below the usual server keep-alive (5 s for
+  uvicorn and Node, 75 s for nginx). And a request that went out on a *reused* connection and got
+  no response at all (no status line) is sent once more, on a new connection, inside the same
+  attempt deadline. httpcore's trace events tell the two cases apart: a request that opened its
+  own connection, or whose response had started, is never resent, because the provider may have
+  processed it. The residual risk is a provider that reads a request on a reused connection and
+  then dies without answering: it may see the request twice. The tenant is still charged once
+  (one reservation, one completion).
 
 ### Why a late primary response can never be used
 
@@ -275,8 +296,8 @@ last attempt, and every attempt is logged.
 | 404 / 405 | `not_found_error` / `invalid_request_error` | `not_found` / `method_not_allowed` | routing |
 | 413 | `invalid_request_error` | `request_too_large` / `payload_too_large` | cost above the whole window / body too big |
 | 429 | `rate_limit_error` | `tenant_token_limit_exceeded` | window full; `Retry-After` set |
-| 502 | `upstream_error` | `upstream_bad_response` | malformed provider response, provider 401/403/404 |
-| 503 | `upstream_error` | `upstream_unavailable` | providers rate limited, down or unreachable |
+| 502 | `upstream_error` | `upstream_bad_response` | malformed or oversized provider response, provider 401/403/404 |
+| 503 | `upstream_error` | `upstream_unavailable` | providers rate limited, down, unreachable or 408/409/425; `Retry-After` when a provider sent one |
 | 503 | `service_unavailable_error` | `rate_limiter_unavailable` | limiter database unavailable (fail closed) |
 | 504 | `timeout_error` | `upstream_timeout` | final attempt hit its deadline |
 | 500 | `internal_error` | `internal_error` | anything unexpected (catch-all) |
@@ -304,6 +325,8 @@ last attempt, and every attempt is logged.
 | Cancelled request leaks its reservation | shielded reserve, release and reconcile |
 | Late reconcile hits a reused row | UUID reservation ids |
 | Primary pool exhaustion blocks failover | separate connection pool per upstream |
+| Provider closes a keep-alive connection as it is reused | 2 s pool expiry; one resend only when nothing came back on a reused connection, inside the same deadline |
+| A provider streams gigabytes within its deadline | body read in chunks, capped at `--max-response-bytes` |
 
 ## Mock provider
 
@@ -329,7 +352,7 @@ pytest          # about 180 tests, ~20 s; deadlines are shortened to 250-300 ms 
 | File | Covers |
 |------|--------|
 | `test_limiter.py` | window sliding and boundaries, per-tenant and sweeper eviction, exact Retry-After, reconcile (incl. over limit), release, restart persistence, raw key absent from DB/WAL bytes, 8 threads and 4 processes on separate connections admitting exactly `floor(limit/cost)`, a Hypothesis property checking every decision and Retry-After against the definition of the window |
-| `test_router.py` | 429/timeout/connect/5xx/malformed failover, policy switches, 4xx not retried, slow-drip body, real-socket check that the timed-out primary sees the connection close, late primary cancelled and never used, outer cancellation, 80 concurrent mixed requests |
+| `test_router.py` | 429/timeout/connect/5xx/malformed/oversized failover, refusals (401/403/404/408/...) fail over unless disabled, 400/413/422 not retried, policy switches, slow-drip body, real-socket checks that the timed-out primary sees the connection close, that a pooled connection closed by the provider is retried once and that a fresh connection or a started response is never resent, keep-alive expiry, upstream `Retry-After` relayed, late primary cancelled and never used, outer cancellation, 80 concurrent mixed requests |
 | `test_errors.py` | catalogue, catch-all 500, routing errors, secrets/hostnames/tracebacks/provider and model names never in responses but present in logs with the same request id, Hypothesis property over random secrets |
 | `test_api.py` | auth, headers, reconcile and release accounting (plausible usage recorded exactly; `2**63`, `10**15`, `0`, negative, malformed and missing usage keep the reservation and still serve; a failing reconcile still returns the completion), timeout race bounded by the deadline with only the fallback counted, client disconnect (receive channel only, no cancellation) and outer cancellation both release, exact Retry-After with an injected clock, validation without echoing input, 40 parallel requests admit exactly `floor(limit/cost)`, two app instances sharing one budget |
 | `test_e2e.py` | uvicorn on ephemeral ports: slow and drip primaries fail over at the deadline and see the gateway hang up; a client that gives up after 0.5 s gets its primary attempt cancelled before the deadline, usage 0 and no secondary call; full failover / 503 / 429 walkthrough |
@@ -348,6 +371,7 @@ pytest          # about 180 tests, ~20 s; deadlines are shortened to 250-300 ms 
 - **Single-host scale.** All writes for all tenants serialise on one SQLite write lock. That is
   plenty for one host (about 9,000 reserve + reconcile pairs per second on a developer laptop, one
   process, WAL mode). Multi-host deployments would move the same algorithm to Redis or Postgres.
-- **No streaming**, and no upstream circuit breaker: a primary answering 429 is tried again on the
-  next request. Upstream `Retry-After` is logged but not used for a cooldown.
+- **No streaming**, and no upstream circuit breaker: a primary answering 429 (or 401) is tried
+  again on the next request. Upstream `Retry-After` is relayed to clients on 503 but not used for a
+  gateway-side cooldown.
 - Upstream clients ignore `HTTP(S)_PROXY`; there is no option yet to configure an egress proxy.

@@ -207,6 +207,26 @@ async def test_primary_429_is_served_by_the_fallback(tmp_path: Path) -> None:
     assert usage == 21
 
 
+async def test_a_primary_refusing_the_gateway_key_is_served_by_the_fallback(tmp_path: Path) -> None:
+    primary = Recorder(respond(401, json_body={"error": "invalid api key sk-provider-primary"}))
+    secondary = Recorder(ok("from fallback", total_tokens=21))
+    async with running_gateway(make_settings(tmp_path), primary, secondary) as gw:
+        response = await gw.chat()
+    assert response.status_code == 200
+    assert response.headers["x-gateway-route"] == "fallback"
+
+
+async def test_upstream_retry_after_reaches_the_client_sanitized(tmp_path: Path) -> None:
+    primary = Recorder(respond(429, json_body={"error": "busy"}, headers={"Retry-After": "7"}))
+    secondary = Recorder(respond(429, json_body={"error": "busy"}, headers={"Retry-After": "2"}))
+    async with running_gateway(make_settings(tmp_path), primary, secondary) as gw:
+        response = await gw.chat()
+    assert response.status_code == 503
+    assert error_of(response)["code"] == "upstream_unavailable"
+    assert response.headers["retry-after"] == "2"
+    assert response.headers["x-ratelimit-remaining"] == "10000"  # released
+
+
 async def test_timeout_race_fails_over_at_the_deadline_and_counts_only_the_fallback(tmp_path: Path) -> None:
     # The primary would answer with a huge usage figure if it were allowed to finish.
     primary = Recorder(ok("PRIMARY", total_tokens=5_000, delay=DEADLINE + 0.1))

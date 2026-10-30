@@ -15,6 +15,7 @@ from typing import Any
 from llm_router.keys import TenantKeyring, fingerprint_api_key
 from llm_router.limiter import DEFAULT_TOKENS_PER_WINDOW, DEFAULT_WINDOW_SECONDS
 from llm_router.router import (
+    DEFAULT_MAX_RESPONSE_BYTES,
     DEFAULT_PRIMARY_TIMEOUT_SECONDS,
     DEFAULT_SECONDARY_TIMEOUT_SECONDS,
     FailoverPolicy,
@@ -41,6 +42,8 @@ class Settings:
     secondary_timeout: float = DEFAULT_SECONDARY_TIMEOUT_SECONDS
     failover_on_connection_error: bool = True
     failover_on_server_error: bool = True
+    failover_on_refused: bool = True
+    max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES
     db_path: Path = Path("data/llm_router.db")
     tokens_per_window: int = DEFAULT_TOKENS_PER_WINDOW
     window_seconds: float = DEFAULT_WINDOW_SECONDS
@@ -66,6 +69,8 @@ class Settings:
             raise ValueError(f"default_max_tokens must be between 1 and {MAX_TOKENS_LIMIT}")
         if self.max_body_bytes < 1024:
             raise ValueError("max_body_bytes must be at least 1024")
+        if self.max_response_bytes < 1024:
+            raise ValueError("max_response_bytes must be at least 1024")
         if self.workers < 1:
             raise ValueError("workers must be at least 1")
         TenantKeyring(self.tenant_key_fingerprints)  # validates the fingerprints
@@ -90,6 +95,7 @@ class Settings:
         return FailoverPolicy(
             on_connection_error=self.failover_on_connection_error,
             on_server_error=self.failover_on_server_error,
+            on_refused=self.failover_on_refused,
         )
 
     def to_env(self) -> dict[str, str]:
@@ -187,6 +193,21 @@ _OPTIONS = (
         "fail over on primary 5xx or malformed responses (default on)",
         to_env=lambda v: "true" if v else "false",
         boolean=True,
+    ),
+    _Option(
+        "--failover-on-refused",
+        "failover_on_refused",
+        _parse_bool,
+        "fail over when the primary refuses with a 4xx other than 400/413/422/429, e.g. 401, 403, "
+        "404, 408 (default on)",
+        to_env=lambda v: "true" if v else "false",
+        boolean=True,
+    ),
+    _Option(
+        "--max-response-bytes",
+        "max_response_bytes",
+        int,
+        "largest provider response body read; bigger is a bad response (default 4 MiB)",
     ),
     _Option("--log-level", "log_level", str, "DEBUG, INFO, WARNING or ERROR (default INFO)"),
 )
