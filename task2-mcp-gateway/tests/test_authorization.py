@@ -9,9 +9,10 @@ from typing import Any
 import httpx
 import pytest
 
+from mcp_gateway import proxy
 from mcp_gateway.auth import Role
 
-from .helpers import Downstream, gateway_client
+from .helpers import Downstream, asgi_scope, gateway_client, make_app
 
 pytestmark = pytest.mark.anyio
 
@@ -31,10 +32,17 @@ async def post_raw(client: httpx.AsyncClient, body: bytes, **headers: str) -> ht
     return await client.post("/mcp", content=body, headers={"Content-Type": "application/json", **headers})
 
 
-def audit_lines(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
-    return [
+def audit_lines(
+    caplog: pytest.LogCaptureFixture, event: str = "mcp_gateway.decision"
+) -> list[dict[str, Any]]:
+    lines = [
         json.loads(record.getMessage()) for record in caplog.records if record.name == "mcp_gateway.audit"
     ]
+    return [line for line in lines if line["event"] == event]
+
+
+def outcome_lines(caplog: pytest.LogCaptureFixture) -> list[dict[str, Any]]:
+    return audit_lines(caplog, "mcp_gateway.outcome")
 
 
 # --- the rule -----------------------------------------------------------------------------------
@@ -92,11 +100,26 @@ async def test_notifications_and_client_responses_are_forwarded(
 # --- bypass attempts ----------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("name", ["Admin_reset_key", "ADMIN_RESET_KEY", "aDmIn_delete_user"])
+async def test_admin_name_case_variants_are_denied_to_viewers(
+    gateway: httpx.AsyncClient, downstream: Downstream, name: str
+) -> None:
+    response = await gateway.post("/mcp", json=tool_call(name))
+
+    assert response.status_code == 200
+    assert response.json()["error"] == DENIED
+    assert downstream.requests == []
+
+
+@pytest.mark.parametrize("role", list(Role))
 @pytest.mark.parametrize(
     "name",
     [
-        "Admin_reset_key",
-        "ADMIN_RESET_KEY",
+        "adm\u0131n_reset_key",  # dotless i: upper-cases to ADMIN_RESET_KEY
+        "adm\u0130n_reset_key",  # capital I with dot above
+        "\u00e0dmin_reset_key",  # precomposed a with grave
+        "a\u0300dmin_reset_key",  # a + combining grave
+        "\u0430dmin_reset_key",  # Cyrillic a
         " admin_reset_key",
         "admin_reset_key ",
         "\tadmin_delete_user",
@@ -104,15 +127,18 @@ async def test_notifications_and_client_responses_are_forwarded(
         "\ufeffadmin_reset_key",
         "\uff41\uff44\uff4d\uff49\uff4e_reset_key",
         "admin\uff3freset_key",
+        "admin_" + "x" * 123,  # 129 characters
     ],
 )
-async def test_admin_name_variants_are_denied_to_viewers(
-    gateway: httpx.AsyncClient, downstream: Downstream, name: str
+async def test_names_outside_the_tool_name_grammar_never_reach_the_downstream(
+    downstream: Downstream, role: Role, name: str
 ) -> None:
-    response = await gateway.post("/mcp", json=tool_call(name))
+    async with gateway_client(downstream, role=role) as gateway:
+        response = await gateway.post("/mcp", json=tool_call(name))
 
-    assert response.status_code == 200
-    assert response.json()["error"] == DENIED
+    assert response.status_code == 400
+    assert response.json()["id"] == 7
+    assert response.json()["error"]["code"] == -32602
     assert downstream.requests == []
 
 
@@ -299,6 +325,133 @@ async def test_every_decision_is_audited_once(
     assert unauthenticated["reason"].startswith("authentication failed")
     assert len({line["request_id"] for line in (allow, deny, reject, unauthenticated)}) == 4
     assert downstream.last.headers["x-gateway-request-id"] == allow["request_id"]
+    # Only the forwarded request has an outcome; the others were answered by the gateway itself.
+    [outcome] = outcome_lines(caplog)
+    assert (
+        outcome.items()
+        >= {
+            "outcome": "forwarded",
+            "request_id": allow["request_id"],
+            "tool": "get_weather",
+            "status": 200,
+            "code": None,
+            **common,
+        }.items()
+    )
+
+
+@pytest.mark.parametrize(
+    ("failure", "outcome", "status", "code"),
+    [
+        (httpx.ConnectError("connection refused"), "downstream_unavailable", 502, -32004),
+        (httpx.ReadTimeout("read timed out"), "downstream_timeout", 504, -32005),
+        (httpx.PoolTimeout("no free connection"), "gateway_busy", 503, -32006),
+        (None, "forwarded", 404, None),  # a downstream error status is relayed, and recorded
+    ],
+)
+async def test_the_outcome_of_a_forwarded_request_is_audited(
+    downstream: Downstream,
+    caplog: pytest.LogCaptureFixture,
+    failure: Exception | None,
+    outcome: str,
+    status: int,
+    code: int | None,
+) -> None:
+    def responder(request: httpx.Request) -> httpx.Response:
+        if failure is not None:
+            raise failure
+        return httpx.Response(404)
+
+    caplog.set_level(logging.INFO, logger="mcp_gateway.audit")
+    downstream.responder = responder
+    async with gateway_client(downstream) as gateway:
+        response = await gateway.post("/mcp", json=tool_call("get_weather"))
+
+    assert response.status_code == status
+    [decision] = audit_lines(caplog)
+    [line] = outcome_lines(caplog)
+    assert decision["decision"] == "allow"
+    assert (line["outcome"], line["status"], line["code"]) == (outcome, status, code)
+    assert line["request_id"] == decision["request_id"]
+    assert line["reason"] == (None if failure is None else type(failure).__name__)
+
+
+async def test_a_client_that_disconnects_mid_body_is_audited(
+    downstream: Downstream, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    app = make_app(downstream)
+    sent: list[dict[str, Any]] = []
+    messages = iter(
+        [
+            {"type": "http.request", "body": b'{"jsonrpc":"2.0","id":1,', "more_body": True},
+            {"type": "http.disconnect"},
+        ]
+    )
+
+    async def receive() -> dict[str, Any]:
+        return next(messages)
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    headers = [(b"content-type", b"application/json"), (b"content-length", b"1000")]
+    async with app.router.lifespan_context(app):
+        await app(asgi_scope("POST", headers), receive, send)  # no exception escapes
+
+    [line] = audit_lines(caplog)
+    assert (line["decision"], line["reason"], line["code"]) == ("reject", "client_disconnected", -32600)
+    assert outcome_lines(caplog) == []
+    assert downstream.requests == []
+    assert "Traceback" not in caplog.text
+
+
+async def test_an_unexpected_error_before_the_decision_is_a_generic_500(
+    downstream: Downstream, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken_policy(*args: Any) -> Any:
+        raise RuntimeError("internal detail: /etc/secret")
+
+    monkeypatch.setattr(proxy, "authorize", broken_policy)
+    caplog.set_level(logging.INFO)
+    async with gateway_client(downstream) as gateway:
+        response = await gateway.post("/mcp", json=tool_call("get_weather"))
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "jsonrpc": "2.0",
+        "id": 7,
+        "error": {"code": -32603, "message": "Internal error"},
+    }
+    assert "secret" not in response.text
+    [line] = audit_lines(caplog)
+    assert (line["decision"], line["reason"], line["status"], line["code"]) == (
+        "reject",
+        "internal_error",
+        500,
+        -32603,
+    )
+    assert downstream.requests == []
+    assert "RuntimeError" in caplog.text  # the traceback is in the operational log
+
+
+async def test_an_unexpected_error_while_forwarding_is_a_generic_500_outcome(
+    downstream: Downstream, caplog: pytest.LogCaptureFixture
+) -> None:
+    def broken_downstream(request: httpx.Request) -> httpx.Response:
+        raise RuntimeError("internal detail")
+
+    downstream.responder = broken_downstream
+    caplog.set_level(logging.INFO, logger="mcp_gateway.audit")
+    async with gateway_client(downstream) as gateway:
+        response = await gateway.post("/mcp", json=tool_call("get_weather"))
+
+    assert response.status_code == 500
+    assert response.json()["error"] == {"code": -32603, "message": "Internal error"}
+    [decision] = audit_lines(caplog)
+    [outcome] = outcome_lines(caplog)
+    assert decision["decision"] == "allow"
+    assert (outcome["outcome"], outcome["status"], outcome["code"]) == ("internal_error", 500, -32603)
 
 
 async def test_audit_lines_never_contain_the_token_and_cannot_be_forged(
@@ -308,12 +461,14 @@ async def test_audit_lines_never_contain_the_token_and_cannot_be_forged(
     hostile = 'admin_x\n{"decision":"allow"}' + "A" * 1000
     async with gateway_client(downstream, role=Role.VIEWER) as gateway:
         token = gateway.headers["authorization"].removeprefix("Bearer ")
-        await gateway.post("/mcp", json=tool_call(hostile))
+        await gateway.post("/mcp", json=tool_call(hostile, rpc_id=hostile))  # a name and an id
 
     records = [record.getMessage() for record in caplog.records if record.name == "mcp_gateway.audit"]
     assert len(records) == 1
     assert "\n" not in records[0]
     line = json.loads(records[0])
-    assert line["decision"] == "deny"
-    assert len(line["tool"]) < 300
+    assert (line["decision"], line["code"]) == ("reject", -32602)
+    assert line["reason"].startswith("tool name outside the MCP grammar")
+    assert len(line["reason"]) < 300
+    assert len(line["rpc_id"]) < 300
     assert token.split(".")[2] not in records[0]

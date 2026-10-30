@@ -10,14 +10,21 @@ import anyio
 import httpx
 import pytest
 
+from mcp_gateway.auth import Role
+from mcp_gateway.config import GatewaySettings
+from mcp_gateway.proxy import create_app
+
 from .helpers import (
     DOWNSTREAM_URL,
     SSE_HEADERS,
+    TEST_SECRET,
     Downstream,
     ScriptedStream,
     asgi_scope,
     gateway_client,
     make_app,
+    serve_wsgi_in_thread,
+    token_for,
 )
 
 pytestmark = pytest.mark.anyio
@@ -25,7 +32,7 @@ pytestmark = pytest.mark.anyio
 PING = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
 EVENT_1 = b'event: message\ndata: {"jsonrpc":"2.0","method":"notifications/progress"}\n\n'
 EVENT_2 = b'event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{}}\n\n'
-GATEWAY_ERROR_CODES = {502: -32004, 504: -32005}
+GATEWAY_ERROR_CODES = {502: -32004, 503: -32006, 504: -32005}
 
 
 async def post(client: httpx.AsyncClient, payload: Any, **headers: str) -> httpx.Response:
@@ -114,6 +121,110 @@ async def test_hop_by_hop_request_headers_are_dropped(
         assert name not in forwarded
     assert forwarded["x-end-to-end"] == "kept"
     assert forwarded["host"] == "downstream.test"
+
+
+async def test_client_forwarding_headers_are_dropped(
+    gateway: httpx.AsyncClient, downstream: Downstream
+) -> None:
+    await post(
+        gateway,
+        PING,
+        **{
+            "X-Forwarded-For": "6.6.6.6",
+            "X-Forwarded-Host": "evil.test",
+            "X-Forwarded-Proto": "https",
+            "Forwarded": "for=6.6.6.6;proto=https",
+            "X-Real-IP": "6.6.6.6",
+        },
+    )
+
+    forwarded = downstream.last.headers
+    for name in ("x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "forwarded", "x-real-ip"):
+        assert name not in forwarded
+
+
+async def test_request_headers_with_underscores_are_dropped(
+    gateway: httpx.AsyncClient, downstream: Downstream
+) -> None:
+    await post(
+        gateway,
+        PING,
+        **{
+            "X_Custom": "underscore",
+            "X-Custom": "hyphen",
+            "X_Forwarded_For": "6.6.6.6",
+            "Content_Encoding": "gzip",
+            "Connection": "keep-alive, X_Hop",
+            "X-Hop": "named-by-connection",
+        },
+    )
+
+    forwarded = downstream.last.headers
+    assert [name for name in forwarded if "_" in name] == []
+    assert forwarded["x-custom"] == "hyphen"
+    for name in ("x-forwarded-for", "content-encoding", "x-hop"):
+        assert name not in forwarded
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "br", "deflate", "identity, gzip", "x-custom"])
+async def test_compressed_request_bodies_are_refused(
+    gateway: httpx.AsyncClient, downstream: Downstream, encoding: str
+) -> None:
+    response = await post(gateway, PING, **{"Content-Encoding": encoding})
+
+    assert_jsonrpc_error(response, 415, -32600)
+    assert response.headers["accept-encoding"] == "identity"
+    assert downstream.requests == []
+
+
+@pytest.mark.parametrize("encoding", ["identity", "Identity", ""])
+async def test_identity_content_encoding_is_accepted_and_not_forwarded(
+    gateway: httpx.AsyncClient, downstream: Downstream, encoding: str
+) -> None:
+    response = await post(gateway, PING, **{"Content-Encoding": encoding})
+
+    assert response.status_code == 200
+    assert "content-encoding" not in downstream.last.headers
+
+
+def environ_echo(environ: dict[str, Any], start_response: Any) -> list[bytes]:
+    """A WSGI downstream that answers with the identity it was asserted, as it reads it."""
+    keys = ("HTTP_X_GATEWAY_ROLE", "HTTP_X_GATEWAY_SUBJECT", "HTTP_MCP_NAME", "HTTP_X_FORWARDED_FOR")
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {key: environ.get(key) for key in keys}}).encode()
+    start_response("200 OK", [("Content-Type", "application/json"), ("Content-Length", str(len(body)))])
+    return [body]
+
+
+async def test_underscore_headers_cannot_spoof_identity_at_a_wsgi_downstream() -> None:
+    """The audit's reproduction: wsgiref reads `X_Gateway_Role` as `X-Gateway-Role`."""
+    tool_call = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "get_weather"}}
+    spoofed = [
+        ("Authorization", f"Bearer {token_for(Role.VIEWER)}"),
+        ("X_Gateway_Role", "admin"),
+        ("X_Gateway_Subject", "root"),
+        ("Mcp_Name", "get_weather"),
+        ("X_Forwarded_For", "6.6.6.6"),
+    ]
+    with serve_wsgi_in_thread(environ_echo) as downstream_url:
+        settings = GatewaySettings(jwt_secret=TEST_SECRET, downstream_url=f"{downstream_url}/mcp")
+        app = create_app(settings)
+        async with (
+            app.router.lifespan_context(app),
+            httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://gateway.test") as client,
+        ):
+            response = await client.post("/mcp", json=tool_call, headers=spoofed)
+            contradicting = await client.post(
+                "/mcp", json=tool_call, headers=[*spoofed[:1], ("Mcp_Name", "admin_reset_key")]
+            )
+
+    assert response.json()["result"] == {
+        "HTTP_X_GATEWAY_ROLE": "viewer",
+        "HTTP_X_GATEWAY_SUBJECT": "alice",
+        "HTTP_MCP_NAME": None,
+        "HTTP_X_FORWARDED_FOR": None,
+    }
+    assert contradicting.status_code == 400
+    assert contradicting.json()["error"]["code"] == -32020
 
 
 async def test_hop_by_hop_response_headers_are_dropped(downstream: Downstream) -> None:
@@ -277,6 +388,8 @@ async def test_other_http_methods_are_rejected(
         (httpx.RemoteProtocolError("malformed status line"), 502),
         (httpx.ConnectTimeout("connect timed out"), 504),
         (httpx.ReadTimeout("read timed out"), 504),
+        # Every pooled connection is busy: the gateway's limit, not a slow downstream.
+        (httpx.PoolTimeout("no free connection in the pool"), 503),
     ],
 )
 async def test_downstream_failures_become_gateway_errors(

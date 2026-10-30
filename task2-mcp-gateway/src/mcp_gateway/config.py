@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 
 DEFAULT_DOWNSTREAM_URL = "http://127.0.0.1:9000/mcp"
 DEFAULT_MAX_BODY_BYTES = 1024 * 1024
+DEFAULT_MAX_STREAMS_PER_SUBJECT = 10
 # The name of the environment variable that holds the secret, not the secret itself.
 JWT_SECRET_ENV = "MCP_GATEWAY_JWT_SECRET"  # noqa: S105
 DEFAULT_JWT_ISSUER = "mcp-gateway-dev"
@@ -52,6 +53,9 @@ class GatewaySettings:
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
     """Largest accepted POST body. Bigger requests get 413 and never reach the downstream."""
 
+    max_streams_per_subject: int = DEFAULT_MAX_STREAMS_PER_SUBJECT
+    """Concurrent GET (server-to-client SSE) streams one token subject may hold open; then 429."""
+
     def __post_init__(self) -> None:
         check_jwt_secret(self.jwt_secret)
         if not self.jwt_issuer or not self.jwt_audience:
@@ -67,5 +71,7 @@ class GatewaySettings:
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
                 raise ConfigError(f"{name} must be a positive number of seconds, got {value!r}")
-        if self.max_body_bytes <= 0:
-            raise ConfigError(f"max_body_bytes must be positive, got {self.max_body_bytes!r}")
+        for name in ("max_body_bytes", "max_streams_per_subject"):
+            value = getattr(self, name)
+            if value <= 0:
+                raise ConfigError(f"{name} must be positive, got {value!r}")

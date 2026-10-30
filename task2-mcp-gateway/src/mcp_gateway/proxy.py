@@ -8,6 +8,10 @@ The gateway exposes one endpoint, `/mcp`, and relays it to one downstream URL:
 
 Every request is authenticated first. A POST body is then parsed, checked against the policy, and
 either answered by the gateway (error or denial) or forwarded in canonical form.
+
+Downstream connections come from two pools. GET streams are open-ended (no read timeout), so they
+get their own pool and a per-subject cap: however many a caller opens, they cannot take the
+connections that POST and DELETE need.
 """
 
 from __future__ import annotations
@@ -17,25 +21,28 @@ import logging
 import re
 import uuid
 from collections.abc import AsyncIterator, Iterable
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 
 import anyio
 import httpx
 from starlette.applications import Starlette
-from starlette.requests import Request
+from starlette.requests import ClientDisconnect, Request
 from starlette.responses import Response
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
-from mcp_gateway.audit import AuditRecord
+from mcp_gateway.audit import AuditRecord, Outcome
 from mcp_gateway.auth import AuthenticationError, Identity, Role, TokenVerifier, bearer_token
 from mcp_gateway.config import GatewaySettings
 from mcp_gateway.jsonrpc import (
     AUTHENTICATION_FAILED,
     DOWNSTREAM_TIMEOUT,
     DOWNSTREAM_UNAVAILABLE,
+    GATEWAY_BUSY,
+    INTERNAL_ERROR,
     INVALID_REQUEST,
+    TOO_MANY_STREAMS,
     UNAUTHORIZED_TOOL_CALL,
     JsonRpcError,
     RequestId,
@@ -76,38 +83,105 @@ REQUEST_ID_HEADER = "x-gateway-request-id"
 # - accept-encoding is replaced by "identity": a compressor would buffer SSE events.
 # - The client's credentials stay at the gateway. Forwarding its token would make the downstream
 #   accept a token that was not issued for it (the MCP spec forbids token passthrough).
+# - Forwarding headers would let the client choose the address the downstream believes it has.
+# - content-encoding no longer describes the body: the gateway forwards a re-serialised one (and
+#   refuses a compressed request body with 415 in the first place).
 DROPPED_REQUEST_HEADERS = HOP_BY_HOP_HEADERS | {
     "host",
     "content-length",
+    "content-encoding",
     "expect",
     "accept-encoding",
     "authorization",
     "cookie",
+    "forwarded",
+    "x-real-ip",
 }
+DROPPED_REQUEST_PREFIXES = (IDENTITY_HEADER_PREFIX, "x-forwarded-")
 # The ASGI server sets its own date/server headers; the downstream's would duplicate them.
 DROPPED_RESPONSE_HEADERS = HOP_BY_HOP_HEADERS | {"date", "server"}
 
 _CONTENT_LENGTH = re.compile(r"[0-9]{1,19}")
 
+# Request/response traffic (POST, DELETE): httpx's usual limits. A request waits at most
+# `connect_timeout` for a free connection, then gets 503 "gateway busy".
+REQUEST_POOL_LIMITS = httpx.Limits(max_connections=100, max_keepalive_connections=20)
+# GET streams: unbounded here, bounded per subject by `StreamSlots` instead, so a stream never waits
+# for a connection and never holds one that a request needs.
+STREAM_POOL_LIMITS = httpx.Limits(max_connections=None, max_keepalive_connections=20)
+
+
+class StreamSlots:
+    """How many GET streams each token subject has open, against a fixed per-subject cap.
+
+    The gateway runs on one event loop and nothing awaits between the check and the increment,
+    so no lock is needed.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self._open: dict[str, int] = {}
+
+    def acquire(self, subject: str) -> bool:
+        count = self._open.get(subject, 0)
+        if count >= self.limit:
+            return False
+        self._open[subject] = count + 1
+        return True
+
+    def release(self, subject: str) -> None:
+        count = self._open[subject] - 1
+        if count:
+            self._open[subject] = count
+        else:
+            del self._open[subject]
+
+    def open_streams(self, subject: str) -> int:
+        return self._open.get(subject, 0)
+
+
+def header_key(name: str | bytes) -> str:
+    """A header name as CGI/WSGI servers read it: case-insensitive, `_` and `-` alike.
+
+    `X_Gateway_Role` and `X-Gateway-Role` both become `HTTP_X_GATEWAY_ROLE` there, so every drop
+    or prefix check compares names in this form.
+    """
+    text = name.decode("latin-1") if isinstance(name, bytes) else name
+    return text.lower().replace("_", "-")
+
 
 def filter_headers(
-    raw: Iterable[tuple[bytes, bytes]], drop: frozenset[str], drop_prefix: str | None = None
+    raw: Iterable[tuple[bytes, bytes]], drop: frozenset[str], drop_prefixes: tuple[str, ...] = ()
 ) -> RawHeaders:
-    """Copy headers (lower-cased names) minus `drop`, `drop_prefix*` and those named by `Connection`."""
+    """Copy headers (lower-cased names) minus `drop`, `drop_prefixes*` and those named by `Connection`.
+
+    Names are compared in `header_key` form, so `_` spellings are dropped too.
+    """
     headers = [(name.lower(), value) for name, value in raw]
     nominated = {
-        token.strip().lower()
+        header_key(token.strip())
         for name, value in headers
-        if name == b"connection"
+        if header_key(name) == "connection"
         for token in value.decode("latin-1").split(",")
     }
     return [
         (name, value)
         for name, value in headers
-        if (key := name.decode("latin-1")) not in drop
+        if (key := header_key(name)) not in drop
         and key not in nominated
-        and not (drop_prefix and key.startswith(drop_prefix))
+        and not key.startswith(drop_prefixes)
     ]
+
+
+def request_headers_to_forward(raw: Iterable[tuple[bytes, bytes]]) -> RawHeaders:
+    """The client's request headers that may reach the downstream.
+
+    Any name containing `_` is dropped outright, as nginx does by default: no standard or MCP header
+    has one, and a downstream that folds `_` into `-` would read it as a header the gateway
+    controls. `filter_headers` also compares names with `_` read as `-`, as a second layer.
+    """
+    kept = filter_headers(raw, DROPPED_REQUEST_HEADERS, DROPPED_REQUEST_PREFIXES)
+    return [(name, value) for name, value in kept if b"_" not in name]
 
 
 def error_response(error: JsonRpcError) -> Response:
@@ -127,6 +201,22 @@ def check_content_type(value: str | None) -> None:
         raise JsonRpcError(INVALID_REQUEST, "Content-Type must be application/json (UTF-8)", http_status=415)
 
 
+def check_content_encoding(values: Iterable[str]) -> None:
+    """POST bodies must not be compressed: the gateway parses the bytes it receives.
+
+    It forwards a re-serialised body, so a `Content-Encoding` would no longer describe what the
+    downstream gets. RFC 7694: answer 415 and list the acceptable coding in `Accept-Encoding`.
+    """
+    codings = [token.strip().lower() for value in values for token in value.split(",") if token.strip()]
+    if any(coding != "identity" for coding in codings):
+        raise JsonRpcError(
+            INVALID_REQUEST,
+            "Content-Encoding is not supported: send an uncompressed body",
+            http_status=415,
+            headers={"Accept-Encoding": "identity"},
+        )
+
+
 async def read_body(request: Request, limit: int) -> bytes:
     """Read the request body, refusing anything larger than `limit` bytes without buffering it."""
     too_large = JsonRpcError(INVALID_REQUEST, f"Request body exceeds {limit} bytes", http_status=413)
@@ -137,10 +227,16 @@ async def read_body(request: Request, limit: int) -> bytes:
         if int(declared) > limit:
             raise too_large
     body = bytearray()
-    async for chunk in request.stream():
-        body += chunk
-        if len(body) > limit:
-            raise too_large
+    try:
+        async for chunk in request.stream():
+            body += chunk
+            if len(body) > limit:
+                raise too_large
+    except ClientDisconnect as exc:
+        # Nobody is left to answer, but the request is still refused and audited like any other.
+        raise JsonRpcError(
+            INVALID_REQUEST, "Request body incomplete: the client disconnected", detail="client_disconnected"
+        ) from exc
     return bytes(body)
 
 
@@ -204,9 +300,13 @@ class Admitted:
 class Gateway:
     """The `/mcp` endpoint (an ASGI app): authenticates, validates, authorizes, forwards."""
 
-    def __init__(self, settings: GatewaySettings, client: httpx.AsyncClient) -> None:
+    def __init__(
+        self, settings: GatewaySettings, client: httpx.AsyncClient, stream_client: httpx.AsyncClient
+    ) -> None:
         self.settings = settings
-        self._client = client
+        self._client = client  # POST and DELETE
+        self._stream_client = stream_client  # GET streams, a separate connection pool
+        self.streams = StreamSlots(settings.max_streams_per_subject)
         self._verifier = TokenVerifier(
             secret=settings.jwt_secret,
             issuer=settings.jwt_issuer,
@@ -221,26 +321,44 @@ class Gateway:
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         # A plain ASGI app rather than a Starlette endpoint, so every HTTP method reaches `handle`
         # and gets a JSON-RPC shaped 405 instead of Starlette's plain-text one.
-        response = await self.handle(Request(scope, receive))
-        await response(scope, receive, send)
+        async with AsyncExitStack() as on_finish:  # released once the response is fully relayed
+            response = await self.handle(Request(scope, receive), on_finish)
+            await response(scope, receive, send)
 
-    async def handle(self, request: Request) -> Response:
-        """Admit or refuse the request (one audit line either way), then forward it."""
+    async def handle(self, request: Request, on_finish: AsyncExitStack) -> Response:
+        """Admit or refuse the request (one decision line either way), then forward it.
+
+        Resources the request holds until its response has been relayed (a stream slot) are
+        registered on `on_finish`.
+        """
         record = AuditRecord(request_id=uuid.uuid4().hex, http_method=request.method)
+        try:
+            return await self._handle(request, record, on_finish)
+        except Exception:
+            # Last resort, for a bug: the client learns nothing about it, and the request is
+            # still audited. The traceback goes to the operational log only.
+            logger.exception("unexpected error while handling request %s", record.request_id)
+            reply_id = record.rpc_id if record.method is not None else None
+            error = JsonRpcError(INTERNAL_ERROR, "Internal error", http_status=500, rpc_id=reply_id)
+            if record.decided:
+                record.emit_outcome("internal_error", status=500, code=INTERNAL_ERROR)
+            else:
+                record.emit("reject", "internal_error", status=500, code=INTERNAL_ERROR)
+            return error_response(error)
+
+    async def _handle(self, request: Request, record: AuditRecord, on_finish: AsyncExitStack) -> Response:
         try:
             identity = self.authenticate(request)
             record.subject, record.role = identity.subject, identity.role.value
-            admitted = await self._admit(request, identity.role, record)
+            admitted = await self._admit(request, identity, record, on_finish)
         except JsonRpcError as error:
             verdict = "deny" if error.code == UNAUTHORIZED_TOOL_CALL else "reject"
             record.emit(verdict, error.detail or error.message, status=error.http_status, code=error.code)
             return error_response(error)
 
+        # Written before anything is forwarded; the outcome line follows once the downstream answers.
         record.emit("allow", admitted.reason)
-        try:
-            return await self.forward(request, identity, record.request_id, admitted)
-        except JsonRpcError as error:
-            return error_response(error)
+        return await self.forward(request, identity, record, admitted)
 
     def authenticate(self, request: Request) -> Identity:
         """Verify the bearer token, before anything else about the request is looked at."""
@@ -255,8 +373,21 @@ class Gateway:
                 detail=f"authentication failed: {exc.reason}",
             ) from exc
 
-    async def _admit(self, request: Request, role: Role, record: AuditRecord) -> Admitted:
+    async def _admit(
+        self, request: Request, identity: Identity, record: AuditRecord, on_finish: AsyncExitStack
+    ) -> Admitted:
         """Validate the request and apply the policy. Raises `JsonRpcError` to refuse it."""
+        if request.method == "GET":
+            # An open-ended stream: cap how many one subject may hold, so a single token cannot
+            # pile up idle streams.
+            if not self.streams.acquire(identity.subject):
+                raise JsonRpcError(
+                    TOO_MANY_STREAMS,
+                    "Too many open streams: close one before opening another",
+                    http_status=429,
+                    detail=f"stream_limit_exceeded ({self.streams.limit} open)",
+                )
+            on_finish.callback(self.streams.release, identity.subject)
         if request.method in _BODYLESS_REASONS:  # no JSON-RPC message, nothing to authorize
             return Admitted(content=None, rpc_id=None, reason=_BODYLESS_REASONS[request.method])
         if request.method != "POST":
@@ -267,12 +398,13 @@ class Gateway:
                 headers={"Allow": ", ".join(ALLOWED_METHODS)},
             )
         check_content_type(request.headers.get("content-type"))
+        check_content_encoding(request.headers.getlist("content-encoding"))
         message = parse_message(await read_body(request, self.settings.max_body_bytes))
         record.method, record.rpc_id = message.method, message.id
         headers = [(name.decode("latin-1"), value.decode("latin-1")) for name, value in request.headers.raw]
         check_routing_headers(message, headers)
 
-        decision = authorize(message, role)
+        decision = authorize(message, identity.role)
         record.tool = decision.tool
         rpc_id = message.id if message.method is not None else None  # a client response is not a request
         if not decision.allowed:
@@ -292,53 +424,72 @@ class Gateway:
         return Admitted(content=message.canonical, rpc_id=rpc_id, reason=decision.reason)
 
     async def forward(
-        self, request: Request, identity: Identity, request_id: str, admitted: Admitted
+        self, request: Request, identity: Identity, record: AuditRecord, admitted: Admitted
     ) -> Response:
-        """Send the request downstream and relay the response; transport failures become 502/504."""
-        rpc_id = admitted.rpc_id
-        headers = filter_headers(request.headers.raw, DROPPED_REQUEST_HEADERS, IDENTITY_HEADER_PREFIX)
+        """Send the request downstream and relay the response; transport failures become 502/503/504.
+
+        Either way, the outcome line goes to the audit log.
+        """
+        headers = request_headers_to_forward(request.headers.raw)
         headers += [
             (b"accept-encoding", b"identity"),
             (SUBJECT_HEADER.encode(), identity.subject.encode()),
             (ROLE_HEADER.encode(), identity.role.value.encode()),
-            (REQUEST_ID_HEADER.encode(), request_id.encode()),
+            (REQUEST_ID_HEADER.encode(), record.request_id.encode()),
         ]
-        upstream_request = self._client.build_request(
+        # POST responses may be SSE too, but each ends once the downstream has answered, and the
+        # read timeout bounds silence on it. Only GET streams are open-ended.
+        is_stream = request.method == "GET"
+        client = self._stream_client if is_stream else self._client
+        upstream_request = client.build_request(
             request.method,
             self.settings.downstream_url,
             headers=headers,
             content=admitted.content,  # httpx sets Content-Length from these bytes
-            timeout=self._stream_timeout if request.method == "GET" else self._timeout,
+            timeout=self._stream_timeout if is_stream else self._timeout,
         )
         try:
-            upstream = await self._client.send(upstream_request, stream=True)
-        except httpx.TimeoutException as exc:
-            logger.warning("downstream %s timed out: %r", request.method, exc)
-            raise JsonRpcError(
-                DOWNSTREAM_TIMEOUT, "Downstream MCP server timed out", http_status=504, rpc_id=rpc_id
-            ) from exc
+            upstream = await client.send(upstream_request, stream=True)
         except httpx.RequestError as exc:
             logger.warning("downstream %s failed: %r", request.method, exc)
-            raise JsonRpcError(
-                DOWNSTREAM_UNAVAILABLE, "Downstream MCP server is unavailable", http_status=502, rpc_id=rpc_id
-            ) from exc
+            outcome, error = transport_failure(exc, admitted.rpc_id)
+            record.emit_outcome(outcome, status=error.http_status, code=error.code, reason=type(exc).__name__)
+            return error_response(error)
         logger.debug("%s %s -> %d", request.method, MCP_PATH, upstream.status_code)
+        record.emit_outcome("forwarded", status=upstream.status_code)
         return StreamedResponse(upstream)
+
+
+def transport_failure(exc: httpx.RequestError, rpc_id: RequestId | None) -> tuple[Outcome, JsonRpcError]:
+    """The reply to a request the downstream never answered. Internal details stay in the log."""
+    if isinstance(exc, httpx.PoolTimeout):
+        # Every pooled connection is busy: the gateway's own limit, not a slow downstream.
+        message = "Gateway busy: too many concurrent requests"
+        return "gateway_busy", JsonRpcError(GATEWAY_BUSY, message, http_status=503, rpc_id=rpc_id)
+    if isinstance(exc, httpx.TimeoutException):
+        message = "Downstream MCP server timed out"
+        return "downstream_timeout", JsonRpcError(DOWNSTREAM_TIMEOUT, message, http_status=504, rpc_id=rpc_id)
+    message = "Downstream MCP server is unavailable"
+    return "downstream_unavailable", JsonRpcError(
+        DOWNSTREAM_UNAVAILABLE, message, http_status=502, rpc_id=rpc_id
+    )
 
 
 def create_app(settings: GatewaySettings, *, transport: httpx.AsyncBaseTransport | None = None) -> Starlette:
     """Build the gateway ASGI app. `transport` replaces the network (tests pass a mock downstream)."""
-    # trust_env=False: HTTP(S)_PROXY and netrc from the environment must not reroute or add
-    # credentials to downstream traffic.
-    client = httpx.AsyncClient(transport=transport, trust_env=False, follow_redirects=False)
-    gateway = Gateway(settings, client)
+
+    def downstream_client(limits: httpx.Limits) -> httpx.AsyncClient:
+        # trust_env=False: HTTP(S)_PROXY and netrc from the environment must not reroute or add
+        # credentials to downstream traffic. (`limits` only apply to httpx's network transport.)
+        return httpx.AsyncClient(transport=transport, limits=limits, trust_env=False, follow_redirects=False)
+
+    client, stream_client = downstream_client(REQUEST_POOL_LIMITS), downstream_client(STREAM_POOL_LIMITS)
+    gateway = Gateway(settings, client, stream_client)
 
     @asynccontextmanager
     async def lifespan(_app: Starlette) -> AsyncIterator[None]:
-        try:
+        async with client, stream_client:  # closed on shutdown
             yield
-        finally:
-            await client.aclose()
 
     app = Starlette(routes=[Route(MCP_PATH, gateway)], lifespan=lifespan)
     app.state.gateway = gateway

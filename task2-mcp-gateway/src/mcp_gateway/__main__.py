@@ -6,6 +6,7 @@ import argparse
 import logging
 import os
 from collections.abc import Sequence
+from typing import Any
 
 import uvicorn
 
@@ -15,14 +16,23 @@ from mcp_gateway.config import (
     DEFAULT_JWT_AUDIENCE,
     DEFAULT_JWT_ISSUER,
     DEFAULT_MAX_BODY_BYTES,
+    DEFAULT_MAX_STREAMS_PER_SUBJECT,
     JWT_SECRET_ENV,
     ConfigError,
     GatewaySettings,
 )
-from mcp_gateway.logging_config import configure_logging
+from mcp_gateway.logging_config import add_log_level_argument, setup_logging
 from mcp_gateway.proxy import MCP_PATH, create_app
 
 logger = logging.getLogger("mcp_gateway")
+
+UVICORN_OPTIONS: dict[str, Any] = {
+    "log_config": None,  # keep the handlers installed by configure_logging
+    "server_header": False,
+    # The access log writes the request line, query string included, and a client may put its
+    # token there (`?access_token=...`). The audit log already records every request, without it.
+    "access_log": False,
+}
 
 
 def _env(name: str, default: str) -> str:
@@ -66,6 +76,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="largest accepted request body (default: %(default)s)",
     )
     parser.add_argument(
+        "--max-streams-per-subject",
+        type=int,
+        default=_env("MAX_STREAMS_PER_SUBJECT", str(DEFAULT_MAX_STREAMS_PER_SUBJECT)),
+        help="concurrent GET (SSE) streams one token subject may hold open (default: %(default)s)",
+    )
+    parser.add_argument(
         "--jwt-issuer",
         default=_env("JWT_ISSUER", DEFAULT_JWT_ISSUER),
         help="required `iss` claim (default: %(default)s)",
@@ -81,7 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=_env("JWT_LEEWAY", "30"),
         help="clock skew tolerated on exp/nbf/iat, in seconds (default: %(default)s)",
     )
-    parser.add_argument("--log-level", default=None, help="DEBUG, INFO, WARNING or ERROR (default: INFO)")
+    add_log_level_argument(parser)
     parser.epilog = (
         f"The HS256 token secret is read from ${JWT_SECRET_ENV} only (at least 32 bytes), never from a flag."
     )
@@ -91,7 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
-    configure_logging(args.log_level)
+    setup_logging(parser, args.log_level)
     try:
         settings = GatewaySettings(
             jwt_secret=os.environ.get(JWT_SECRET_ENV, ""),
@@ -102,6 +118,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             connect_timeout=args.connect_timeout,
             read_timeout=args.read_timeout,
             max_body_bytes=args.max_body_bytes,
+            max_streams_per_subject=args.max_streams_per_subject,
         )
     except ConfigError as exc:
         parser.error(str(exc))
@@ -115,13 +132,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         MCP_PATH,
         settings.downstream_url,
     )
-    uvicorn.run(
-        create_app(settings),
-        host=args.host,
-        port=args.port,
-        log_config=None,  # keep the handler installed by configure_logging
-        server_header=False,
-    )
+    uvicorn.run(create_app(settings), host=args.host, port=args.port, **UVICORN_OPTIONS)
 
 
 if __name__ == "__main__":

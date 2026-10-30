@@ -29,7 +29,7 @@ from mcp.shared.exceptions import MCPError
 from starlette.applications import Starlette
 
 from mcp_gateway import __version__
-from mcp_gateway.logging_config import configure_logging
+from mcp_gateway.logging_config import add_log_level_argument, setup_logging
 from mcp_gateway.proxy import ROLE_HEADER, SUBJECT_HEADER
 
 logger = logging.getLogger("mcp_gateway.mock_mcp_server")
@@ -158,10 +158,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--port", type=int, default=9000, help="bind port (default: %(default)s)")
     parser.add_argument("--sse", action="store_true", help="answer with SSE streams instead of JSON")
     parser.add_argument("--stateful", action="store_true", help="issue Mcp-Session-Id session ids")
-    parser.add_argument("--log-level", default=None, help="DEBUG, INFO, WARNING or ERROR (default: INFO)")
+    add_log_level_argument(parser)
     args = parser.parse_args(argv)
 
-    configure_logging(args.log_level)
+    setup_logging(parser, args.log_level)
     logger.info("starting %s on http://%s:%d/mcp", SERVER_NAME, args.host, args.port)
     app = create_mock_app(sse=args.sse, stateful=args.stateful, host=args.host)
     uvicorn.run(app, host=args.host, port=args.port, log_config=None)

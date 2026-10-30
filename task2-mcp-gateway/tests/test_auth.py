@@ -226,7 +226,16 @@ async def test_token_is_replaced_by_verified_identity_headers(downstream: Downst
 
 @pytest.mark.anyio
 async def test_client_supplied_identity_headers_are_discarded(downstream: Downstream) -> None:
-    spoofed = {"X-Gateway-Role": "admin", "X-Gateway-Subject": "root", "X-Gateway-Impersonate": "admin"}
+    spoofed = [
+        ("X-Gateway-Role", "admin"),
+        ("X-Gateway-Subject", "root"),
+        ("X-Gateway-Impersonate", "admin"),
+        # Underscore spellings: a CGI/WSGI downstream reads them as X-Gateway-Role/-Subject.
+        ("X_Gateway_Role", "admin"),
+        ("x_gateway_subject", "root"),
+        ("X-Gateway_Role", "admin"),
+        ("X_Gateway-Request-Id", "forged"),
+    ]
     async with gateway_client(downstream, role=Role.VIEWER) as gateway:
         await gateway.post("/mcp", json=PING, headers=spoofed)
 
@@ -234,6 +243,9 @@ async def test_client_supplied_identity_headers_are_discarded(downstream: Downst
     assert forwarded.get_list("x-gateway-role") == ["viewer"]
     assert forwarded.get_list("x-gateway-subject") == ["alice"]
     assert "x-gateway-impersonate" not in forwarded
+    identity_headers = sorted(name for name in forwarded if name.replace("_", "-").startswith("x-gateway-"))
+    assert identity_headers == ["x-gateway-request-id", "x-gateway-role", "x-gateway-subject"]
+    assert forwarded["x-gateway-request-id"] != "forged"
 
 
 @pytest.mark.anyio

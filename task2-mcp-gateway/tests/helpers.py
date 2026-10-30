@@ -8,13 +8,17 @@ import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from wsgiref.simple_server import WSGIRequestHandler, make_server
 
 import anyio
 import httpx
 import uvicorn
 from starlette.applications import Starlette
 from starlette.types import ASGIApp
+
+if TYPE_CHECKING:
+    from _typeshed.wsgi import WSGIApplication
 
 from mcp_gateway.auth import Role, mint_token
 from mcp_gateway.config import DEFAULT_JWT_AUDIENCE, DEFAULT_JWT_ISSUER, GatewaySettings
@@ -129,9 +133,11 @@ async def gateway_client(
         yield client
 
 
-def asgi_scope(method: str, headers: list[tuple[bytes, bytes]], role: Role = Role.VIEWER) -> dict[str, Any]:
+def asgi_scope(
+    method: str, headers: list[tuple[bytes, bytes]], role: Role = Role.VIEWER, subject: str = "alice"
+) -> dict[str, Any]:
     """A raw ASGI HTTP scope for `/mcp`, for tests that drive the app message by message."""
-    authorization = (b"authorization", f"Bearer {token_for(role)}".encode())
+    authorization = (b"authorization", f"Bearer {token_for(role, subject)}".encode())
     return {
         "type": "http",
         "asgi": {"version": "3.0", "spec_version": "2.4"},
@@ -148,12 +154,37 @@ def asgi_scope(method: str, headers: list[tuple[bytes, bytes]], role: Role = Rol
     }
 
 
+class _QuietWSGIRequestHandler(WSGIRequestHandler):
+    def log_message(self, *args: Any) -> None:
+        pass
+
+
 @contextmanager
-def serve_in_thread(app: ASGIApp) -> Iterator[str]:
-    """Serve `app` with uvicorn on an ephemeral localhost port in a background thread; yield its URL."""
-    config = uvicorn.Config(
-        app, host="127.0.0.1", port=0, log_config=None, log_level="warning", timeout_graceful_shutdown=2
-    )
+def serve_wsgi_in_thread(app: WSGIApplication) -> Iterator[str]:
+    """Serve a WSGI app with the stdlib `wsgiref` server on an ephemeral localhost port; yield its URL.
+
+    `wsgiref`, like every CGI-style server, maps header names to `HTTP_*` keys with `-` turned into
+    `_`, so `X-Gateway-Role` and `X_Gateway_Role` reach the app as the same key.
+    """
+    server = make_server("127.0.0.1", 0, app, handler_class=_QuietWSGIRequestHandler)
+    thread = threading.Thread(target=server.serve_forever, name="wsgiref-test-server", daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=10)
+
+
+@contextmanager
+def serve_in_thread(app: ASGIApp, **options: Any) -> Iterator[str]:
+    """Serve `app` with uvicorn on an ephemeral localhost port in a background thread; yield its URL.
+
+    `options` override the uvicorn.Config defaults used here.
+    """
+    defaults: dict[str, Any] = {"log_config": None, "log_level": "warning", "timeout_graceful_shutdown": 2}
+    config = uvicorn.Config(app, host="127.0.0.1", port=0, **{**defaults, **options})
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, name="uvicorn-test-server", daemon=True)
     thread.start()

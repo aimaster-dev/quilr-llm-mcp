@@ -5,12 +5,20 @@ form. Two JSON parsers can read the same bytes differently (duplicate keys, `NaN
 surrogates, non-UTF-8 encodings, ...), so `parse_message` refuses every input where they might,
 and the gateway forwards `Message.canonical` (re-serialised from the parsed object) rather than
 the bytes it received.
+
+Numbers are the one thing re-serialisation would otherwise change: a float round trip turns
+`12345678901234567890.5` into `1.2345678901234567e+19` and `1E2` into `100.0`. A non-integer
+number therefore keeps the text it was written as (`JsonNumber.lexeme`), and that text is what
+is forwarded. It is safe to copy: the parser only accepts the JSON number grammar (ASCII digits),
+the value is checked to be finite, and nothing the gateway authorizes depends on a number.
+Integers are exact already (Python ints have arbitrary precision); only `-0` becomes `0`.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -21,12 +29,15 @@ RequestId = str | int
 PARSE_ERROR = -32700
 INVALID_REQUEST = -32600
 INVALID_PARAMS = -32602
+INTERNAL_ERROR = -32603
 
 # Gateway codes, from the implementation-defined server-error band (-32000..-32019).
 UNAUTHORIZED_TOOL_CALL = -32001
 AUTHENTICATION_FAILED = -32003
 DOWNSTREAM_UNAVAILABLE = -32004
 DOWNSTREAM_TIMEOUT = -32005
+GATEWAY_BUSY = -32006  # every pooled downstream connection is in use (HTTP 503)
+TOO_MANY_STREAMS = -32007  # the caller already holds its maximum of open GET streams (HTTP 429)
 
 # MCP 2026-07-28: the HTTP routing headers disagree with the body.
 HEADER_MISMATCH = -32020
@@ -82,7 +93,7 @@ class Message:
 
     payload: dict[str, Any]
     canonical: bytes
-    """The bytes the gateway forwards: `payload` re-serialised as compact UTF-8 JSON."""
+    """The bytes the gateway forwards: `payload` re-serialised as compact UTF-8 JSON (`canonical_json`)."""
 
     @property
     def method(self) -> str | None:
@@ -125,11 +136,78 @@ def _reject_constant(name: str) -> Any:
     raise ValueError(f"{name} is not valid JSON")
 
 
-def _finite_float(text: str) -> float:
-    value = float(text)
-    if not math.isfinite(value):  # 1e999 parses to inf, which has no JSON representation
+class JsonNumber(float):
+    """A non-integer JSON number: its value as a float, and the exact text it was written as."""
+
+    __slots__ = ("lexeme",)
+    lexeme: str
+
+
+# RFC 8259 section 6, with ASCII digits only (`\d` would also match other scripts' digits).
+_NUMBER = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?")
+
+
+def _json_number(text: str) -> JsonNumber:
+    # The JSON scanner only ever passes a number lexeme; it is checked again because it is
+    # forwarded verbatim.
+    if not _NUMBER.fullmatch(text):
+        raise ValueError("malformed number")
+    number = JsonNumber(text)
+    if not math.isfinite(number):  # 1e999 parses to inf, which has no JSON representation
         raise ValueError("number out of range")
-    return value
+    number.lexeme = text
+    return number
+
+
+class _Text(str):
+    """Output that `canonical_json` emits as is (punctuation, encoded keys), not as a JSON string."""
+
+
+_LBRACE, _RBRACE, _LBRACKET, _RBRACKET, _COMMA = map(_Text, "{}[],")
+_json_string = json.JSONEncoder(ensure_ascii=False).encode  # str -> its JSON string literal
+
+
+def canonical_json(value: Any) -> str:
+    """Compact JSON for a parsed message (dicts, lists, str, int, bool, None, `JsonNumber`).
+
+    The same text as `json.dumps(value, ensure_ascii=False, separators=(",", ":"))`, except that a
+    `JsonNumber` is written as its lexeme. Iterative, so it handles any depth the parser accepted.
+    """
+    out: list[str] = []
+    pending: list[Any] = [value]  # a stack, popped from the end: pushed in reverse order
+    while pending:
+        item = pending.pop()
+        kind = type(item)
+        if kind is _Text:
+            out.append(item)
+        elif kind is str:
+            out.append(_json_string(item))
+        elif kind is dict:
+            pending.append(_RBRACE)
+            for index, (key, member) in enumerate(reversed(item.items())):
+                if index:
+                    pending.append(_COMMA)
+                pending.append(member)
+                pending.append(_Text(_json_string(key) + ":"))
+            pending.append(_LBRACE)
+        elif kind is list:
+            pending.append(_RBRACKET)
+            for index, member in enumerate(reversed(item)):
+                if index:
+                    pending.append(_COMMA)
+                pending.append(member)
+            pending.append(_LBRACKET)
+        elif item is None:
+            out.append("null")
+        elif kind is bool:
+            out.append("true" if item else "false")
+        elif kind is int:
+            out.append(int.__repr__(item))
+        elif kind is JsonNumber:
+            out.append(item.lexeme)
+        else:
+            raise TypeError(f"not a parsed JSON value: {kind.__name__}")
+    return "".join(out)
 
 
 def parse_message(body: bytes) -> Message:
@@ -141,11 +219,10 @@ def parse_message(body: bytes) -> Message:
             body.decode("utf-8"),
             object_pairs_hook=_unique_keys,
             parse_constant=_reject_constant,
-            parse_float=_finite_float,
+            parse_float=_json_number,
         )
-        canonical = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
         # Strict encoding rejects lone surrogates ("\ud800"), which other parsers replace or drop.
-        canonical_bytes = canonical.encode("utf-8")
+        canonical_bytes = canonical_json(payload).encode("utf-8")
     except _DuplicateKeyError as exc:
         detail = f"duplicate object key {exc.args[0]!r}"[:200]
         raise JsonRpcError(PARSE_ERROR, "Parse error: duplicate object key", detail=detail) from exc
