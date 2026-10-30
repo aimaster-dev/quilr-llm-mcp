@@ -384,6 +384,35 @@ async def test_limiter_database_failure_fails_closed(tmp_path: Path, monkeypatch
     assert primary.requests == []
 
 
+async def test_a_locked_database_gives_every_caller_a_quick_503(tmp_path: Path) -> None:
+    """Another process holds the write lock: callers get 503s promptly, not one per busy timeout."""
+    busy, parallel = 0.25, 8
+    primary = Recorder(ok())
+    settings = make_settings(tmp_path, db_busy_timeout=busy, db_fail_fast=1.0)
+    async with running_gateway(settings, primary) as gw:
+        blocker = sqlite3.connect(settings.db_path, isolation_level=None)
+        try:
+            blocker.execute("BEGIN EXCLUSIVE")
+            responses: list[httpx.Response] = []
+
+            async def one() -> None:
+                responses.append(await gw.chat())
+
+            started = anyio.current_time()
+            async with anyio.create_task_group() as tg:
+                for _ in range(parallel):
+                    tg.start_soon(one)
+            elapsed = anyio.current_time() - started
+        finally:
+            blocker.execute("ROLLBACK")
+            blocker.close()
+
+    assert [r.status_code for r in responses] == [503] * parallel
+    assert {error_of(r)["code"] for r in responses} == {"rate_limiter_unavailable"}
+    assert elapsed < busy + 0.5  # was parallel x busy (2 s) before the fail-fast window
+    assert primary.requests == []
+
+
 async def test_raw_tenant_keys_never_reach_the_database(tmp_path: Path) -> None:
     async with running_gateway(make_settings(tmp_path), Recorder(ok())) as gw:
         assert (await gw.chat(KEY_A)).status_code == 200

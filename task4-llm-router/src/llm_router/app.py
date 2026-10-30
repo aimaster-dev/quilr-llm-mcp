@@ -52,7 +52,12 @@ from llm_router.errors import (
     ServiceUnavailableError,
 )
 from llm_router.keys import TenantKeyring
-from llm_router.limiter import AsyncTokenRateLimiter, LimitDecision, Outcome, TokenRateLimiter
+from llm_router.limiter import (
+    AsyncTokenRateLimiter,
+    LimitDecision,
+    LimiterUnavailableError,
+    Outcome,
+)
 from llm_router.logging_config import configure_logging
 from llm_router.middleware import EXCEPTION_HANDLERS, MIDDLEWARE, current_request_id
 from llm_router.router import Completion, ModelRouter
@@ -100,7 +105,8 @@ async def _release(gateway: Gateway, tenant: str, decision: LimitDecision) -> in
     try:
         await gateway.limiter.release(decision.reservation_id)
         used = await gateway.limiter.usage(tenant)
-    except sqlite3.Error:
+    except (sqlite3.Error, LimiterUnavailableError):
+        # Fail safe: the row keeps its estimate until the window drains.
         logger.exception("could not release reservation %s", decision.reservation_id)
         return None
     return decision.limit - used
@@ -178,7 +184,7 @@ async def chat_completions(request: Request) -> Response:
     with anyio.CancelScope(shield=True):
         try:
             decision = await gateway.limiter.reserve(tenant, cost)
-        except sqlite3.Error as exc:
+        except (sqlite3.Error, LimiterUnavailableError) as exc:
             raise ServiceUnavailableError(
                 code="rate_limiter_unavailable", log_detail=f"limiter database error: {exc!r}"
             ) from None
@@ -290,15 +296,8 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
-        sync_limiter = await anyio.to_thread.run_sync(
-            lambda: TokenRateLimiter(
-                settings.db_path,
-                limit_tokens=settings.tokens_per_window,
-                window_seconds=settings.window_seconds,
-                clock=clock,
-            )
-        )
-        limiter = AsyncTokenRateLimiter(sync_limiter)
+        sync_limiter = await anyio.to_thread.run_sync(settings.open_limiter, clock)
+        limiter = AsyncTokenRateLimiter(sync_limiter, fail_fast_seconds=settings.db_fail_fast)
         try:
             async with (
                 ModelRouter(

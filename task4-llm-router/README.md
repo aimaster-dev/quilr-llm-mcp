@@ -83,6 +83,9 @@ WARNING llm_router.middleware [req_104d...] POST /v1/chat/completions -> 503 ups
 ```
 
 `llm-router --workers 4` runs four server processes; they share one budget through the SQLite file.
+**Not on Windows:** uvicorn's multi-process mode there can intermittently leave concurrent
+connections unanswered (plain uvicorn `--workers` shows the same thing), so `llm-router` logs a
+warning when `--workers` is above 1 on Windows. Use one worker on Windows; scale out on Linux.
 
 ### Configuration
 
@@ -101,10 +104,12 @@ Every flag also reads an `LLM_ROUTER_*` environment variable (`--primary-timeout
 | `--max-response-bytes` | `4194304` | larger provider bodies are a bad response |
 | `--tokens-per-window`, `--window-seconds` | `50000`, `60` | per tenant API key |
 | `--db-path` | `data/llm_router.db` | must be on a local disk (SQLite locking) |
+| `--db-busy-timeout-ms` | `1000` | how long a limiter transaction waits for the SQLite write lock |
+| `--db-fail-fast-ms` | `1000` | after a limiter database error, answer 503 at once for this long (`0` disables) |
 | `--sweep-interval` | `30` | seconds between global evictions |
 | `--default-max-tokens` | `1024` | used, and sent upstream, when the client omits `max_tokens` |
 | `--max-body-bytes` | `1048576` | larger bodies get `413 payload_too_large` |
-| `--host`, `--port`, `--workers`, `--log-level` | `127.0.0.1`, `8080`, `1`, `INFO` | |
+| `--host`, `--port`, `--workers`, `--log-level` | `127.0.0.1`, `8080`, `1`, `INFO` | `--workers` above 1: Linux/macOS only (see above) |
 
 | Environment only | |
 |------|---|
@@ -148,7 +153,7 @@ CREATE TABLE reservations (
 );
 CREATE INDEX reservations_tenant_ts ON reservations (tenant, ts);
 CREATE INDEX reservations_ts ON reservations (ts);   -- for the global sweeper
--- PRAGMA journal_mode=WAL; busy_timeout=5000; synchronous=NORMAL
+-- PRAGMA journal_mode=WAL; busy_timeout=1000; synchronous=NORMAL
 ```
 
 ### Check-and-reserve is one transaction
@@ -167,6 +172,22 @@ never both read the same `used` and both insert. WAL lets readers run alongside 
 `busy_timeout` makes a contending writer wait instead of failing. The event loop never touches
 SQLite: every call runs on a worker thread through `anyio.to_thread.run_sync`. A limiter whose
 database is unavailable fails closed with `503 rate_limiter_unavailable`.
+
+### Availability when the database is stuck
+
+- **Short busy timeout.** A transaction holds the write lock for well under a millisecond, so a
+  writer waits at most `--db-busy-timeout-ms` (1000) for it. Waiting longer only delays the 503.
+- **Fail fast.** Limiter calls queue for one worker thread per process. With a locked database each
+  queued call used to wait out its own busy timeout, so the k-th caller got its 503 after k
+  timeouts (5.6 s, 11.1 s, 16.6 s, ... with the old 5 s value). Now, after any SQLite error, every
+  call fails immediately for `--db-fail-fast-ms` (1000), including the calls already queued, and
+  the first call after that window probes the database again. A stuck database costs one caller
+  one busy timeout; everyone else gets an immediate 503.
+- **Cold start.** When several processes create a new database file at once, switching it to WAL
+  needs an exclusive lock that `busy_timeout` does not cover, so an open could fail with "database
+  is locked". Opening is retried with jittered backoff for up to 10 s on `SQLITE_BUSY` /
+  `SQLITE_LOCKED`, and `llm-router` creates the database in the parent process before starting
+  any worker. A database that cannot be opened at all stops start-up with a one-line error.
 
 ### Cost, reconciliation and release
 
@@ -298,7 +319,7 @@ last attempt, and every attempt is logged.
 | 429 | `rate_limit_error` | `tenant_token_limit_exceeded` | window full; `Retry-After` set |
 | 502 | `upstream_error` | `upstream_bad_response` | malformed or oversized provider response, provider 401/403/404 |
 | 503 | `upstream_error` | `upstream_unavailable` | providers rate limited, down, unreachable or 408/409/425; `Retry-After` when a provider sent one |
-| 503 | `service_unavailable_error` | `rate_limiter_unavailable` | limiter database unavailable (fail closed) |
+| 503 | `service_unavailable_error` | `rate_limiter_unavailable` | limiter database unavailable (fail closed, fast) |
 | 504 | `timeout_error` | `upstream_timeout` | final attempt hit its deadline |
 | 500 | `internal_error` | `internal_error` | anything unexpected (catch-all) |
 
@@ -317,6 +338,8 @@ last attempt, and every attempt is logged.
 |--------|-------|
 | Two requests both read `used` and both insert | `BEGIN IMMEDIATE`: check and insert under SQLite's write lock, across processes |
 | Slow lock wait leaves a stale timestamp | clock read inside the transaction |
+| Locked database: queued calls each wait a busy timeout | 1 s busy timeout, then every call fails fast for 1 s |
+| Workers race to create a new database | open retried on `SQLITE_BUSY`; the parent creates it before workers start |
 | Event loop blocked by disk I/O | SQLite only on worker threads (`anyio.to_thread`, capacity 1 per process) |
 | Slow-drip body evades socket timeouts | one deadline over the whole attempt |
 | Late primary response used or counted | sequential attempts; cancelled response closed before the secondary starts |
@@ -351,7 +374,8 @@ pytest          # about 180 tests, ~20 s; deadlines are shortened to 250-300 ms 
 
 | File | Covers |
 |------|--------|
-| `test_limiter.py` | window sliding and boundaries, per-tenant and sweeper eviction, exact Retry-After, reconcile (incl. over limit), release, restart persistence, raw key absent from DB/WAL bytes, 8 threads and 4 processes on separate connections admitting exactly `floor(limit/cost)`, a Hypothesis property checking every decision and Retry-After against the definition of the window |
+| `test_limiter.py` | window sliding and boundaries, per-tenant and sweeper eviction, exact Retry-After, reconcile (incl. over limit, out-of-range counts refused), release, restart persistence, raw key absent from DB/WAL bytes, 8 threads and 4 processes on separate connections admitting exactly `floor(limit/cost)`, 12 connections creating a fresh database at once, a locked database failing fast (bounded timing) and recovering, a Hypothesis property checking every decision and Retry-After against the definition of the window |
+| `test_main.py` | the database is created before any worker starts, an unusable path is a clean start-up error, the Windows multi-worker warning |
 | `test_router.py` | 429/timeout/connect/5xx/malformed/oversized failover, refusals (401/403/404/408/...) fail over unless disabled, 400/413/422 not retried, policy switches, slow-drip body, real-socket checks that the timed-out primary sees the connection close, that a pooled connection closed by the provider is retried once and that a fresh connection or a started response is never resent, keep-alive expiry, upstream `Retry-After` relayed, late primary cancelled and never used, outer cancellation, 80 concurrent mixed requests |
 | `test_errors.py` | catalogue, catch-all 500, routing errors, secrets/hostnames/tracebacks/provider and model names never in responses but present in logs with the same request id, Hypothesis property over random secrets |
 | `test_api.py` | auth, headers, reconcile and release accounting (plausible usage recorded exactly; `2**63`, `10**15`, `0`, negative, malformed and missing usage keep the reservation and still serve; a failing reconcile still returns the completion), timeout race bounded by the deadline with only the fallback counted, client disconnect (receive channel only, no cancellation) and outer cancellation both release, exact Retry-After with an injected clock, validation without echoing input, 40 parallel requests admit exactly `floor(limit/cost)`, two app instances sharing one budget |

@@ -7,13 +7,20 @@ tenant keys) are read from the environment only, so they never appear in process
 from __future__ import annotations
 
 import argparse
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from llm_router.keys import TenantKeyring, fingerprint_api_key
-from llm_router.limiter import DEFAULT_TOKENS_PER_WINDOW, DEFAULT_WINDOW_SECONDS
+from llm_router.limiter import (
+    DEFAULT_BUSY_TIMEOUT_MS,
+    DEFAULT_FAIL_FAST_SECONDS,
+    DEFAULT_TOKENS_PER_WINDOW,
+    DEFAULT_WINDOW_SECONDS,
+    TokenRateLimiter,
+)
 from llm_router.router import (
     DEFAULT_MAX_RESPONSE_BYTES,
     DEFAULT_PRIMARY_TIMEOUT_SECONDS,
@@ -45,6 +52,10 @@ class Settings:
     failover_on_refused: bool = True
     max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES
     db_path: Path = Path("data/llm_router.db")
+    #: Seconds a limiter transaction waits for SQLite's write lock.
+    db_busy_timeout: float = DEFAULT_BUSY_TIMEOUT_MS / 1000
+    #: Seconds every limiter call fails fast (503) after a database error.
+    db_fail_fast: float = DEFAULT_FAIL_FAST_SECONDS
     tokens_per_window: int = DEFAULT_TOKENS_PER_WINDOW
     window_seconds: float = DEFAULT_WINDOW_SECONDS
     sweep_interval: float = 30.0
@@ -63,6 +74,9 @@ class Settings:
         for name in ("primary_timeout", "secondary_timeout", "window_seconds", "sweep_interval"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
+        for name in ("db_busy_timeout", "db_fail_fast"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must not be negative")
         if self.tokens_per_window < 1:
             raise ValueError("tokens_per_window must be at least 1")
         if not 1 <= self.default_max_tokens <= MAX_TOKENS_LIMIT:
@@ -89,6 +103,16 @@ class Settings:
             self.secondary_model,
             self.secondary_timeout,
             self.secondary_api_key,
+        )
+
+    def open_limiter(self, clock: Callable[[], float] = time.time) -> TokenRateLimiter:
+        """Open (creating if needed) the limiter database described by these settings."""
+        return TokenRateLimiter(
+            self.db_path,
+            limit_tokens=self.tokens_per_window,
+            window_seconds=self.window_seconds,
+            clock=clock,
+            busy_timeout_ms=round(self.db_busy_timeout * 1000),
         )
 
     def failover_policy(self) -> FailoverPolicy:
@@ -150,6 +174,20 @@ _OPTIONS = (
     _Option("--port", "port", int, "port to listen on (default 8080)"),
     _Option("--workers", "workers", int, "server worker processes sharing the limiter database (default 1)"),
     _Option("--db-path", "db_path", Path, "SQLite database file (default data/llm_router.db)"),
+    _Option(
+        "--db-busy-timeout-ms",
+        "db_busy_timeout",
+        _ms_to_seconds,
+        "how long a limiter transaction waits for the SQLite write lock (default 1000)",
+        to_env=_seconds_to_ms,
+    ),
+    _Option(
+        "--db-fail-fast-ms",
+        "db_fail_fast",
+        _ms_to_seconds,
+        "after a limiter database error, answer 503 at once for this long (default 1000; 0 disables)",
+        to_env=_seconds_to_ms,
+    ),
     _Option("--tokens-per-window", "tokens_per_window", int, "token budget per tenant (default 50000)"),
     _Option("--window-seconds", "window_seconds", float, "sliding window length (default 60)"),
     _Option("--sweep-interval", "sweep_interval", float, "seconds between expired-row sweeps (default 30)"),

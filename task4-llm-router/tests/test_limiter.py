@@ -6,6 +6,7 @@ import multiprocessing
 import sqlite3
 import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -16,11 +17,13 @@ from hypothesis import strategies as st
 
 from llm_router.keys import fingerprint_api_key
 from llm_router.limiter import (
+    DEFAULT_BUSY_TIMEOUT_MS,
     DEFAULT_TOKENS_PER_WINDOW,
     DEFAULT_WINDOW_SECONDS,
     MAX_ROW_TOKENS,
     AsyncTokenRateLimiter,
     LimitDecision,
+    LimiterUnavailableError,
     Outcome,
     TokenRateLimiter,
 )
@@ -52,6 +55,43 @@ def test_database_uses_wal_and_busy_timeout(make_limiter, db_path: Path) -> None
         assert probe.execute("PRAGMA journal_mode").fetchone() == ("wal",)
         assert probe.execute("PRAGMA user_version").fetchone() == (1,)
     probe.close()
+
+
+def test_concurrent_first_opens_of_a_new_database_all_succeed(tmp_path: Path) -> None:
+    """Many connections creating the same brand-new file at once (as worker processes do).
+
+    Switching to WAL needs an exclusive lock and is not covered by busy_timeout, so without the
+    retry some of these opens failed with "database is locked" (about 1 in 15 on Windows).
+    """
+    threads, rounds = 12, 8
+    for attempt in range(rounds):
+        db = tmp_path / f"cold-{attempt}.db"
+        barrier = threading.Barrier(threads)
+
+        def open_and_reserve(db: Path = db, barrier: threading.Barrier = barrier) -> bool:
+            barrier.wait(timeout=10)
+            with TokenRateLimiter(db, limit_tokens=1_000) as limiter:
+                return limiter.reserve(TENANT_A, 10).admitted
+
+        with ThreadPoolExecutor(threads) as pool:
+            assert all(pool.map(lambda _: open_and_reserve(), range(threads)))
+        with TokenRateLimiter(db) as limiter:
+            assert limiter.usage(TENANT_A) == threads * 10
+
+
+def test_a_database_that_stays_locked_still_fails_to_open(db_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("llm_router.limiter.INIT_RETRY_SECONDS", 0.3)
+    TokenRateLimiter(db_path).close()
+    blocker = sqlite3.connect(db_path, isolation_level=None)
+    try:
+        blocker.execute("BEGIN EXCLUSIVE")
+        started = time.monotonic()
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            TokenRateLimiter(db_path, busy_timeout_ms=50)
+        assert time.monotonic() - started < 3
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
 
 
 def test_refuses_a_newer_schema(db_path: Path) -> None:
@@ -334,6 +374,67 @@ async def test_async_facade_is_atomic_and_runs_off_the_event_loop(make_limiter, 
 
     assert sum(d.admitted for d in decisions) == 10
     assert seen_threads and loop_thread not in seen_threads
+
+
+# -- availability: a locked database fails fast --------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_a_locked_database_fails_fast_instead_of_queueing(make_limiter, db_path: Path) -> None:
+    """Queued calls must not each wait out their own busy timeout behind the limiter thread."""
+    busy, queued = 0.3, 6
+    limiter = AsyncTokenRateLimiter(make_limiter(busy_timeout_ms=int(busy * 1000)), fail_fast_seconds=0.6)
+    blocker = sqlite3.connect(db_path, isolation_level=None)
+    outcomes: list[str] = []
+
+    async def attempt() -> None:
+        try:
+            await limiter.reserve(TENANT_A, 10)
+            outcomes.append("admitted")
+        except sqlite3.OperationalError:
+            outcomes.append("locked")
+        except LimiterUnavailableError:
+            outcomes.append("failed fast")
+
+    try:
+        blocker.execute("BEGIN EXCLUSIVE")  # another process holding the write lock
+        started = anyio.current_time()
+        async with anyio.create_task_group() as tg:
+            for _ in range(queued):
+                tg.start_soon(attempt)
+        elapsed = anyio.current_time() - started
+        # Only the first call waited for the lock; the rest failed at once. Without the fail-fast
+        # window the last caller would have waited queued x busy = 1.8 s.
+        assert sorted(outcomes) == ["failed fast"] * (queued - 1) + ["locked"]
+        assert elapsed < busy + 0.4
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+
+    # Still inside the window: no probe yet, even though the lock is gone.
+    with pytest.raises(LimiterUnavailableError):
+        await limiter.reserve(TENANT_A, 10)
+    await anyio.sleep(0.7)
+    assert (await limiter.reserve(TENANT_A, 10)).admitted  # recovered after the window
+
+
+@pytest.mark.anyio
+async def test_fail_fast_can_be_disabled(make_limiter, db_path: Path) -> None:
+    limiter = AsyncTokenRateLimiter(make_limiter(busy_timeout_ms=50), fail_fast_seconds=0)
+    blocker = sqlite3.connect(db_path, isolation_level=None)
+    try:
+        blocker.execute("BEGIN EXCLUSIVE")
+        for _ in range(2):
+            with pytest.raises(sqlite3.OperationalError):
+                await limiter.reserve(TENANT_A, 10)
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+    assert (await limiter.reserve(TENANT_A, 10)).admitted
+
+
+def test_default_busy_timeout_is_short() -> None:
+    assert DEFAULT_BUSY_TIMEOUT_MS == 1_000
 
 
 # -- property: decisions match the definition of a sliding window -------------------------------

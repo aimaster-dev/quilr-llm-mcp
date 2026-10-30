@@ -11,6 +11,12 @@ threads or worker processes can never both read the same usage and both insert. 
 readers proceed while a writer holds the lock, and ``busy_timeout`` makes a contending writer wait
 for the lock instead of failing.
 
+Availability: the busy timeout is short (1 s), and after any SQLite failure the async facade fails
+every call immediately for a short window (1 s) instead of letting each queued call wait out its
+own busy timeout behind the single limiter thread. Callers then get a quick 503, not one after
+``k`` busy timeouts. Opening a brand-new database is retried while another process is creating it
+(switching to WAL mode is not covered by ``busy_timeout``).
+
 Lifecycle of a reservation:
 
 1. ``reserve`` inserts ``prompt_estimate + max_tokens`` for the tenant (or rejects the request).
@@ -28,6 +34,7 @@ from __future__ import annotations
 
 import logging
 import math
+import random
 import sqlite3
 import threading
 import time
@@ -48,7 +55,13 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TOKENS_PER_WINDOW = 50_000
 DEFAULT_WINDOW_SECONDS = 60.0
-DEFAULT_BUSY_TIMEOUT_MS = 5_000
+#: How long one transaction waits for SQLite's write lock. Real transactions hold it for well under
+#: a millisecond, so waiting longer only delays the 503 when the database is genuinely stuck.
+DEFAULT_BUSY_TIMEOUT_MS = 1_000
+#: After a failure, every limiter call fails immediately for this long (see AsyncTokenRateLimiter).
+DEFAULT_FAIL_FAST_SECONDS = 1.0
+#: How long opening a database keeps retrying while other processes are creating it.
+INIT_RETRY_SECONDS = 10.0
 SCHEMA_VERSION = 1
 #: Largest token count a row may hold: far above any real request, and small enough that SUM()
 #: over a tenant's rows can never overflow SQLite's 64-bit INTEGER (which would make every later
@@ -70,6 +83,19 @@ _SCHEMA = (
 
 Clock = Callable[[], float]
 T = TypeVar("T")
+
+
+class LimiterUnavailableError(RuntimeError):
+    """The limiter database failed moments ago, so this call failed fast without touching it."""
+
+
+def is_busy_error(exc: sqlite3.Error) -> bool:
+    """SQLITE_BUSY / SQLITE_LOCKED (including extended codes): another connection holds a lock."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None:
+        return code & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+    message = str(exc).lower()
+    return "locked" in message or "busy" in message
 
 
 class Outcome(StrEnum):
@@ -132,9 +158,29 @@ class TokenRateLimiter:
         self._clock = clock
         self._lock = threading.Lock()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = self._connect(busy_timeout_ms)
+        self._conn = self._open(busy_timeout_ms)
 
     # -- connection management ---------------------------------------------------------------
+
+    def _open(self, busy_timeout_ms: int) -> sqlite3.Connection:
+        """Connect and initialise, retrying while other connections are initialising too.
+
+        When several processes open a brand-new file at once, ``PRAGMA journal_mode = WAL`` can
+        fail with "database is locked" straight away: changing the journal mode needs an exclusive
+        lock and is not covered by ``busy_timeout``. Initialisation is idempotent, so it is simply
+        retried with jittered exponential backoff.
+        """
+        deadline = time.monotonic() + INIT_RETRY_SECONDS
+        delay = 0.005
+        while True:
+            try:
+                return self._connect(busy_timeout_ms)
+            except sqlite3.OperationalError as exc:
+                if not is_busy_error(exc) or time.monotonic() + delay > deadline:
+                    raise
+                logger.debug("rate-limiter database busy while opening (%s); retrying", exc)
+            time.sleep(delay * random.uniform(0.5, 1.5))  # noqa: S311 - jitter, not security
+            delay = min(delay * 2, 0.2)
 
     def _connect(self, busy_timeout_ms: int) -> sqlite3.Connection:
         # isolation_level=None: the sqlite3 module never opens transactions implicitly; we issue
@@ -312,12 +358,28 @@ class AsyncTokenRateLimiter:
 
     The calls are not abandoned on cancellation (anyio's default): a transaction that started
     always finishes, and the cancellation is delivered once it has.
+
+    Fail fast: calls queue for the single limiter thread. If the database is locked, each of them
+    would wait out its own busy timeout in turn, so the k-th caller would get its error after
+    k busy timeouts. Instead, once a call fails with a SQLite error, every call for the next
+    ``fail_fast_seconds`` (including those already queued) raises ``LimiterUnavailableError``
+    without touching the database. The first call after the window probes it again.
     """
 
-    def __init__(self, limiter: TokenRateLimiter, *, max_threads: int = 1) -> None:
+    def __init__(
+        self,
+        limiter: TokenRateLimiter,
+        *,
+        max_threads: int = 1,
+        fail_fast_seconds: float = DEFAULT_FAIL_FAST_SECONDS,
+    ) -> None:
+        if not (math.isfinite(fail_fast_seconds) and fail_fast_seconds >= 0):
+            raise ValueError("fail_fast_seconds must be a non-negative number")
         self.sync = limiter
         # The sync limiter serialises on its own lock, so more threads would only queue up there.
         self._threads = anyio.CapacityLimiter(max_threads)
+        self._fail_fast_seconds = fail_fast_seconds
+        self._failed_at: float | None = None  # time.monotonic() of the last failure
 
     @property
     def limit(self) -> int:
@@ -327,8 +389,25 @@ class AsyncTokenRateLimiter:
     def window(self) -> float:
         return self.sync.window
 
+    def _check_available(self) -> None:
+        failed_at = self._failed_at
+        if failed_at is not None and time.monotonic() - failed_at < self._fail_fast_seconds:
+            raise LimiterUnavailableError(
+                f"rate-limiter database failed {time.monotonic() - failed_at:.3f}s ago; failing fast"
+            )
+
+    def _call(self, func: Callable[..., T], *args: object) -> T:
+        """Runs on the worker thread, so calls that queued behind a failure fail fast too."""
+        self._check_available()
+        try:
+            return func(*args)
+        except sqlite3.Error:
+            self._failed_at = time.monotonic()
+            raise
+
     async def _run(self, func: Callable[..., T], *args: object) -> T:
-        return await anyio.to_thread.run_sync(func, *args, limiter=self._threads)
+        self._check_available()  # no need to queue for the thread at all
+        return await anyio.to_thread.run_sync(self._call, func, *args, limiter=self._threads)
 
     async def reserve(self, tenant: str, cost: int) -> LimitDecision:
         return await self._run(self.sync.reserve, tenant, cost)
@@ -351,7 +430,7 @@ class AsyncTokenRateLimiter:
             await anyio.sleep(interval_seconds)
             try:
                 removed = await self.sweep()
-            except sqlite3.Error:
+            except (sqlite3.Error, LimiterUnavailableError):
                 logger.exception("rate-limiter sweep failed; retrying next interval")
             else:
                 if removed:

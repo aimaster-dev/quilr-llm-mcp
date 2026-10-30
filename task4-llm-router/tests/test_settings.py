@@ -18,6 +18,7 @@ BASE_ENV = {
 
 def test_defaults_match_the_spec() -> None:
     settings = load_settings([], BASE_ENV)
+    assert (settings.db_busy_timeout, settings.db_fail_fast) == (1.0, 1.0)
     assert settings.primary_timeout == 3.0  # 3000 ms
     assert settings.tokens_per_window == 50_000
     assert settings.window_seconds == 60.0
@@ -80,6 +81,8 @@ def test_secrets_stay_out_of_repr() -> None:
         (["--primary-timeout-ms", "0"], BASE_ENV),
         (["--tokens-per-window", "0"], BASE_ENV),
         (["--max-response-bytes", "100"], BASE_ENV),
+        (["--db-busy-timeout-ms", "-1"], BASE_ENV),
+        ([], {**BASE_ENV, "LLM_ROUTER_DB_FAIL_FAST_MS": "-5"}),
         ([], {**BASE_ENV, "LLM_ROUTER_FAILOVER_ON_SERVER_ERROR": "maybe"}),
         ([], {**BASE_ENV, "LLM_ROUTER_TENANT_KEY_SHA256": "not-a-digest"}),
     ],
@@ -105,6 +108,10 @@ def test_environment_round_trip_for_worker_processes(tmp_path: Path) -> None:
         "--no-failover-on-refused",
         "--max-response-bytes",
         "65536",
+        "--db-busy-timeout-ms",
+        "250",
+        "--db-fail-fast-ms",
+        "1500",
         "--workers",
         "4",
     ]
