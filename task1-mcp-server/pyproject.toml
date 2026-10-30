@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "jsonschema>=4.20"]
 
 [project.scripts]
 customer-mcp = "customer_mcp.__main__:main"

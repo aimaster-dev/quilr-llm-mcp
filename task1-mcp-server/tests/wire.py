@@ -16,16 +16,30 @@ HANDSHAKE_VERSION = "2025-11-25"
 SERVER_CMD = [sys.executable, "-m", "customer_mcp"]
 
 
+def server_env(env: dict[str, str] | None = None, *, unbuffered: bool = False) -> dict[str, str]:
+    """The environment an MCP host gives a server: stdout fully buffered, as on any pipe.
+
+    PYTHONUNBUFFERED is removed unless asked for: it makes stray output reach the pipe at once,
+    which hides the bugs where buffered output is flushed onto the wire later (e.g. at exit).
+    """
+    base = {key: value for key, value in os.environ.items() if key != "PYTHONUNBUFFERED"}
+    if unbuffered:
+        base["PYTHONUNBUFFERED"] = "1"
+    return {**base, **(env or {})}
+
+
 class StdioWireClient:
     """Spawns a server and records every byte it writes to stdout and stderr."""
 
-    def __init__(self, args: list[str] | None = None, env: dict[str, str] | None = None) -> None:
+    def __init__(
+        self, args: list[str] | None = None, env: dict[str, str] | None = None, *, unbuffered: bool = False
+    ) -> None:
         self.proc = subprocess.Popen(
             args or SERVER_CMD,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env={**os.environ, "PYTHONUNBUFFERED": "1", **(env or {})},
+            env=server_env(env, unbuffered=unbuffered),
             cwd=Path(__file__).resolve().parent,
         )
         self.stdout_lines: list[bytes] = []
@@ -124,6 +138,7 @@ def assert_pure_jsonrpc(lines: list[bytes]) -> None:
     assert lines, "server wrote nothing to stdout"
     for raw in lines:
         assert raw.endswith(b"\n"), f"unterminated stdout line: {raw!r}"
+        assert not raw.endswith(b"\r\n"), f"CRLF-terminated stdout line: {raw!r}"
         message = json.loads(raw)
         assert isinstance(message, dict), raw
         assert message.get("jsonrpc") == "2.0", raw

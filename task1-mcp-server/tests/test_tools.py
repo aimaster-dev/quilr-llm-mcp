@@ -2,19 +2,24 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from typing import Any
 
 import anyio
 import mcp_types as types
 import pytest
+from jsonschema import Draft202012Validator
 from mcp import Client
 from mcp.shared.exceptions import MCPError
 
+from customer_mcp.schemas import ToolErrorText
 from customer_mcp.server import create_server
 from customer_mcp.store import CustomerStore
 
 pytestmark = pytest.mark.anyio
+
+TOOL_ERROR_SCHEMA = ToolErrorText.model_json_schema()
 
 
 @pytest.fixture
@@ -27,6 +32,16 @@ async def call_expecting_error(client: Client, name: str, arguments: dict[str, A
     with pytest.raises(MCPError) as exc:
         await client.call_tool(name, arguments)
     return exc.value
+
+
+def tool_error(result: types.CallToolResult) -> dict[str, str]:
+    """The error of an `isError` result: JSON text content, and no structured content."""
+    assert result.is_error is True
+    assert result.structured_content is None
+    assert isinstance(result.content[0], types.TextContent)
+    payload = json.loads(result.content[0].text)
+    Draft202012Validator(TOOL_ERROR_SCHEMA).validate(payload)
+    return payload["error"]
 
 
 async def test_lists_both_tools_with_strict_schemas(client: Client) -> None:
@@ -42,6 +57,8 @@ async def test_lists_both_tools_with_strict_schemas(client: Client) -> None:
     lookup = tools["get_customer_record"]
     assert lookup.annotations is not None
     assert lookup.annotations.read_only_hint is True
+    # Both work on the same in-memory store, so they describe the same (closed) world.
+    assert lookup.annotations.open_world_hint is refund.annotations.open_world_hint is False
 
 
 async def test_get_customer_record(client: Client) -> None:
@@ -55,10 +72,40 @@ async def test_get_customer_record(client: Client) -> None:
 
 async def test_unknown_customer_is_a_tool_execution_error(client: Client) -> None:
     result = await client.call_tool("get_customer_record", {"customer_id": "CUST-99999"})
-    assert result.is_error is True
-    assert result.structured_content == {
-        "error": {"code": "customer_not_found", "message": "Customer CUST-99999 was not found"}
+    assert tool_error(result) == {
+        "code": "customer_not_found",
+        "message": "Customer CUST-99999 was not found",
     }
+
+
+async def test_every_result_conforms_to_the_advertised_schemas(client: Client) -> None:
+    # MCP: structured results MUST conform to the tool's outputSchema. Successful results carry
+    # structuredContent that validates against it; error results carry none (a client such as the
+    # TypeScript SDK validates any structuredContent it gets), and their text is the error schema.
+    tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+    calls: list[tuple[str, dict[str, Any], bool]] = [
+        ("get_customer_record", {"customer_id": "CUST-10001"}, False),
+        ("get_customer_record", {"customer_id": "CUST-99999"}, True),
+        (
+            "trigger_refund",
+            {"customer_id": "CUST-10002", "amount": 10.5, "reason": "Duplicate charge"},
+            False,
+        ),
+        ("trigger_refund", {"customer_id": "CUST-10004", "amount": 1, "reason": "Duplicate charge"}, True),
+        ("trigger_refund", {"customer_id": "CUST-10002", "amount": 999, "reason": "Duplicate charge"}, True),
+    ]
+    for name, arguments, fails in calls:
+        output_schema = tools[name].output_schema
+        assert output_schema is not None
+        Draft202012Validator.check_schema(output_schema)
+        result = await client.call_tool(name, arguments)
+        if fails:
+            tool_error(result)
+        else:
+            assert result.is_error is False
+            Draft202012Validator(output_schema).validate(result.structured_content)
+            assert isinstance(result.content[0], types.TextContent)
+            assert json.loads(result.content[0].text) == result.structured_content
 
 
 async def test_refund_reduces_refundable_balance(client: Client) -> None:
@@ -91,8 +138,7 @@ async def test_refund_business_rules(client: Client, customer_id: str, amount: f
         "trigger_refund",
         {"customer_id": customer_id, "amount": amount, "reason": "Customer requested refund"},
     )
-    assert result.is_error is True
-    assert result.structured_content["error"]["code"] == code
+    assert tool_error(result)["code"] == code
 
 
 async def test_invalid_arguments_are_json_rpc_invalid_params(client: Client) -> None:

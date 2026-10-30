@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+import re
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -17,9 +18,17 @@ import mcp_types as types
 from mcp.shared.exceptions import MCPError
 from pydantic import BaseModel, ValidationError
 
+from customer_mcp.schemas import ToolErrorDetail, ToolErrorText
+
 logger = logging.getLogger(__name__)
 
 MAX_REPORTED_ERRORS = 20
+# A name is echoed back in error `data` only if it looks like one: MCP's tool-name alphabet for tool
+# names, an identifier for argument names. Anything else (control characters, a 100 KB string, an
+# argument *named* "SSN 123-45-6789") is replaced, never copied to the wire.
+_ECHOABLE_TOOL_NAME = re.compile(r"[A-Za-z0-9_.\-]{1,128}")
+_ECHOABLE_FIELD_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+REDACTED_FIELD = "(redacted)"
 
 ToolHandler = Callable[[Any], Awaitable[BaseModel]]
 
@@ -76,7 +85,8 @@ class ToolRegistry:
         spec = self._specs.get(name)
         if spec is None:
             # MCP spec: unknown tools are a protocol error with code -32602.
-            raise MCPError(code=types.INVALID_PARAMS, message="Unknown tool", data={"tool": name[:128]})
+            echo = {"tool": name} if _ECHOABLE_TOOL_NAME.fullmatch(name) else None
+            raise MCPError(code=types.INVALID_PARAMS, message="Unknown tool", data=echo)
 
         try:
             params = spec.input_model.model_validate(dict(arguments or {}))
@@ -105,24 +115,37 @@ class ToolRegistry:
         )
 
 
-def describe_validation_errors(exc: ValidationError) -> list[dict[str, str]]:
-    """Summarise a ValidationError without echoing the caller's input values back.
+def describe_validation_errors(
+    exc: ValidationError, *, strip_prefix: str | None = None
+) -> list[dict[str, str]]:
+    """Summarise a ValidationError without echoing the caller's input back.
 
     Inputs can contain sensitive data (and arbitrarily large payloads), so only the field path,
-    the error type and Pydantic's generic message are returned.
+    the error type and Pydantic's generic message are returned. A path segment that is not a
+    plain identifier (an unexpected key the caller chose) is redacted. `strip_prefix` drops a
+    leading segment, e.g. the `params` the SDK prepends to request-level paths.
     """
     details: list[dict[str, str]] = []
     for error in exc.errors(include_url=False, include_input=False, include_context=False):
-        field = ".".join(str(part) for part in error["loc"]) or "(root)"
-        details.append({"field": field[:64], "type": error["type"], "message": error["msg"]})
+        loc: Sequence[int | str] = error["loc"]
+        if strip_prefix is not None and len(loc) > 1 and loc[0] == strip_prefix:
+            loc = loc[1:]
+        details.append({"field": _field_path(loc), "type": error["type"], "message": error["msg"]})
         if len(details) >= MAX_REPORTED_ERRORS:
             break
     return details
 
 
+def _field_path(loc: Sequence[int | str]) -> str:
+    parts = [
+        str(part) if isinstance(part, int) or _ECHOABLE_FIELD_NAME.fullmatch(part) else REDACTED_FIELD
+        for part in loc
+    ]
+    return ".".join(parts) or "(root)"
+
+
 def _error_result(code: str, message: str) -> types.CallToolResult:
-    return types.CallToolResult(
-        content=[types.TextContent(text=message)],
-        structured_content={"error": {"code": code, "message": message}},
-        is_error=True,
-    )
+    # No `structuredContent`: the tool's `outputSchema` describes a successful result, and MCP says
+    # structured content MUST conform to it. The error is machine-readable JSON in the text instead.
+    text = ToolErrorText(error=ToolErrorDetail(code=code, message=message)).model_dump_json()
+    return types.CallToolResult(content=[types.TextContent(text=text)], is_error=True)

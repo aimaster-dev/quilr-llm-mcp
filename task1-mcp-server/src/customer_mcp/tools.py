@@ -92,8 +92,10 @@ def customer_tools(store: CustomerStore) -> list[ToolSpec]:
             input_model=TriggerRefundInput,
             output_model=RefundReceipt,
             handler=trigger_refund,
+            # Closed world, like the lookup: both tools touch only the server's own store. Backed
+            # by a real CRM or payments provider, both would become open-world.
             annotations=types.ToolAnnotations(
-                read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=True
+                read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=False
             ),
         ),
     ]
