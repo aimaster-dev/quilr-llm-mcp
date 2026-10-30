@@ -13,6 +13,12 @@ customer-mcp --log-level DEBUG        # or: python -m customer_mcp
 The process reads JSON-RPC from stdin and writes JSON-RPC to stdout, one message per line.
 **Logs go to stderr only.**
 
+Closing stdin ends the session, but not before every request already read has been answered: a
+client may write its whole session and close stdin (`customer-mcp < requests.jsonl`) and still get
+every reply. The server waits up to 30 seconds for in-flight requests, logs a warning on stderr if
+any are still running, then shuts down (those get a `Connection closed` error). Requests the client
+cancelled with `notifications/cancelled` are not waited for, since MCP forbids answering them.
+
 ## Tools
 
 | Tool | Arguments | Notes |
@@ -114,3 +120,4 @@ pytest
 | `test_frames.py` | Envelope validation of raw stdin lines |
 | `test_protocol_errors.py` | Every JSON-RPC error code, asserted on the real binary's stdout |
 | `test_stdio_transport.py` | Handshake, stderr-only logging, stray-output isolation, official SDK client over stdio |
+| `test_shutdown.py` | Every request read before stdin EOF is answered (10 parallel replays), cancelled and stuck requests |

@@ -20,6 +20,13 @@ only well-formed messages reach the SDK.
 Reading stdin ourselves means we also own its claim (`_claim_stdin`). As the SDK does for fd 1,
 the wire is read from a private duplicate and fd 0 points at the null device, so nothing else in
 the process (or a child process) can consume bytes meant for the server.
+
+EOF on stdin does not end the session while requests are still being handled. The SDK cancels
+in-flight handlers as soon as its input ends, so a client that writes its requests and closes stdin
+(`customer-mcp < requests.jsonl`) would lose the replies to every request still running. The ids of
+forwarded requests are tracked (`PendingRequests`) and the outbound stream clears each one as its
+response or error goes out; at EOF the input is held open until nothing is pending (bounded by
+`EOF_DRAIN_TIMEOUT`).
 """
 
 from __future__ import annotations
@@ -30,8 +37,10 @@ import json
 import logging
 import os
 import sys
+from collections import Counter
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from types import TracebackType
 from typing import IO, Any, cast
 
 import anyio
@@ -40,13 +49,17 @@ from anyio.abc import ObjectSendStream
 from mcp.os.win32.utilities import rebind_std_handle_to_fd
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
+from mcp.shared.dispatcher import as_request_id, coerce_request_id
 from mcp.shared.message import SessionMessage
 
 logger = logging.getLogger(__name__)
 
+EOF_DRAIN_TIMEOUT = 30.0
+"""Seconds to wait at stdin EOF for in-flight requests to be answered before shutting down."""
+
 
 async def serve_stdio(server: Server[Any]) -> None:
-    """Serve `server` over stdin/stdout until the client closes stdin."""
+    """Serve `server` over stdin/stdout until the client closes stdin and every request is answered."""
     with _claim_stdin() as wire_in:
         lines = CheckedLines(
             anyio.wrap_file(_UnownedTextWrapper(wire_in, encoding="utf-8", errors="replace"))
@@ -55,8 +68,95 @@ async def serve_stdio(server: Server[Any]) -> None:
         # The SDK only iterates `stdin` line by line, so a checked line iterator can stand in for it.
         async with stdio_server(stdin=cast("anyio.AsyncFile[str]", lines)) as (read_stream, write_stream):
             lines.bind_replies(write_stream)
+            # The server's replies pass through a stream that marks each answered request id. The
+            # frame layer keeps the raw stream: its own replies answer nothing that was forwarded.
+            outbound = AnsweringStream(write_stream, lines.pending)
             with contextlib.redirect_stdout(sys.stderr):
-                await server.run(read_stream, write_stream, server.create_initialization_options())
+                await server.run(read_stream, outbound, server.create_initialization_options())
+
+
+# ---------------------------------------------------------------------------------------------
+# In-flight request tracking
+# ---------------------------------------------------------------------------------------------
+class PendingRequests:
+    """Ids of requests handed to the SDK that have not been answered yet.
+
+    A multiset: JSON-RPC does not forbid a client from reusing an id while the first request is
+    still running, and each such request gets its own reply.
+    """
+
+    def __init__(self) -> None:
+        self._ids: Counter[types.RequestId] = Counter()
+        self._idle = anyio.Event()
+        self._idle.set()
+
+    def __len__(self) -> int:
+        return self._ids.total()
+
+    def add(self, request_id: types.RequestId) -> None:
+        if self._idle.is_set():
+            self._idle = anyio.Event()
+        self._ids[request_id] += 1
+
+    def answered(self, request_id: types.RequestId) -> None:
+        self._discard(request_id)
+
+    def cancelled(self, request_id: types.RequestId) -> None:
+        """The client cancelled a request: the SDK will never answer it (MCP forbids a reply).
+
+        The SDK matches `"7"` and `7` as the same id, so the cancellation is matched the same way.
+        """
+        if request_id in self._ids:
+            self._discard(request_id)
+            return
+        target = coerce_request_id(request_id)
+        for pending_id in self._ids:
+            if coerce_request_id(pending_id) == target:
+                self._discard(pending_id)
+                return
+
+    async def wait_until_idle(self) -> None:
+        await self._idle.wait()
+
+    def _discard(self, request_id: types.RequestId) -> None:
+        if self._ids[request_id] <= 1:
+            self._ids.pop(request_id, None)
+        else:
+            self._ids[request_id] -= 1
+        if not self._ids:
+            self._idle.set()
+
+
+class AnsweringStream:
+    """Outbound stream wrapper: each response or error the server sends answers one pending id.
+
+    An id is cleared only once the reply has been handed to the stdout writer, so by the time the
+    input is allowed to end, every reply is already on its way to the wire.
+    """
+
+    def __init__(self, inner: Any, pending: PendingRequests) -> None:
+        self._inner = inner
+        self._pending = pending
+
+    async def send(self, item: SessionMessage, /) -> None:
+        await self._inner.send(item)
+        message = item.message
+        if isinstance(message, types.JSONRPCResponse | types.JSONRPCError) and message.id is not None:
+            self._pending.answered(message.id)
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+    async def __aenter__(self) -> AnsweringStream:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        await self.aclose()
 
 
 # ---------------------------------------------------------------------------------------------
@@ -68,6 +168,8 @@ class FrameCheck:
 
     forward: bool
     error: types.JSONRPCError | None = None
+    # The decoded frame, kept for in-flight tracking; not part of the verdict.
+    message: Mapping[str, Any] | None = field(default=None, compare=False)
 
 
 FORWARD = FrameCheck(forward=True)
@@ -98,11 +200,11 @@ def check_frame(line: str) -> FrameCheck:
     if not isinstance(message, dict):
         return _reject(None, types.INVALID_REQUEST, "Invalid Request", "Message must be a JSON object")
     if "method" not in message and ("result" in message or "error" in message):
-        return FORWARD
+        return FrameCheck(forward=True, message=message)
 
     problem = _envelope_problem(message)
     if problem is None:
-        return FORWARD
+        return FrameCheck(forward=True, message=message)
     request_id = message.get("id")
     return _reject(
         request_id if _is_valid_id(request_id) else None, types.INVALID_REQUEST, "Invalid Request", problem
@@ -147,13 +249,16 @@ class CheckedLines:
     """Async line iterator handed to the SDK in place of stdin.
 
     Well-formed frames are yielded to the SDK's reader; malformed ones are answered directly on the
-    outbound stream and never reach the dispatcher.
+    outbound stream and never reach the dispatcher. At EOF the iterator ends only once every
+    forwarded request has been answered, or after `drain_timeout` seconds.
     """
 
-    def __init__(self, source: anyio.AsyncFile[str]) -> None:
+    def __init__(self, source: anyio.AsyncFile[str], *, drain_timeout: float | None = None) -> None:
         self._source = source
         self._replies: ObjectSendStream[SessionMessage] | None = None
         self._bound = anyio.Event()
+        self._drain_timeout = EOF_DRAIN_TIMEOUT if drain_timeout is None else drain_timeout
+        self.pending = PendingRequests()
 
     def bind_replies(self, replies: ObjectSendStream[SessionMessage]) -> None:
         self._replies = replies
@@ -166,12 +271,39 @@ class CheckedLines:
         while True:
             line = await self._source.readline()
             if not line:
+                await self._drain()
                 raise StopAsyncIteration
             check = check_frame(line)
             if check.forward:
+                self._track(check.message)
                 return line
             if check.error is not None:
                 await self._answer(check.error)
+
+    def _track(self, message: Mapping[str, Any] | None) -> None:
+        if message is None or "method" not in message:
+            return  # a response from the client: nothing to answer
+        if "id" in message:
+            self.pending.add(message["id"])
+        elif message["method"] == "notifications/cancelled":
+            params = message.get("params")
+            cancelled = as_request_id(params.get("requestId")) if isinstance(params, Mapping) else None
+            if cancelled is not None:
+                self.pending.cancelled(cancelled)
+
+    async def _drain(self) -> None:
+        """Hold the input open at EOF until every forwarded request has been answered."""
+        if not self.pending:
+            return
+        logger.debug("stdin closed; waiting for %d in-flight request(s)", len(self.pending))
+        with anyio.move_on_after(self._drain_timeout):
+            await self.pending.wait_until_idle()
+        if self.pending:
+            logger.warning(
+                "stdin closed; %d request(s) still unanswered after %.0f s, shutting down anyway",
+                len(self.pending),
+                self._drain_timeout,
+            )
 
     async def _answer(self, reply: types.JSONRPCError) -> None:
         # The data string is a fixed description, never a copy of the client's input.

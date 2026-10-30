@@ -16,6 +16,10 @@ HANDSHAKE_VERSION = "2025-11-25"
 SERVER_CMD = [sys.executable, "-m", "customer_mcp"]
 
 
+def server_env(env: dict[str, str] | None = None) -> dict[str, str]:
+    return {**os.environ, "PYTHONUNBUFFERED": "1", **(env or {})}
+
+
 class StdioWireClient:
     """Spawns a server and records every byte it writes to stdout and stderr."""
 
@@ -25,7 +29,7 @@ class StdioWireClient:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env={**os.environ, "PYTHONUNBUFFERED": "1", **(env or {})},
+            env=server_env(env),
             cwd=Path(__file__).resolve().parent,
         )
         self.stdout_lines: list[bytes] = []
