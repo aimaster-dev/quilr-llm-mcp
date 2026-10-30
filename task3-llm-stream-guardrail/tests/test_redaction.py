@@ -46,6 +46,24 @@ def stream(chunks: list[str]) -> str:
         # Local parts are capped at 64 chars, so a longer run keeps its head. The domain is always
         # redacted.
         ("a" * 70 + "@x.com", "a" * 6 + R),
+        # A decomposed (NFD) accent is part of the local part or label.
+        ("Mail jose\u0301@example.com", f"Mail {R}"),
+        ("Mail a@exa\u0301mple.com", f"Mail {R}"),
+        # CJK text is written without spaces: the address stops at it on both sides.
+        ("请联系john@example.com获取帮助", f"请联系{R}获取帮助"),
+        ("メールはjohn@example.comまで", f"メールは{R}まで"),
+        ("이메일은john@example.com으로", f"이메일은{R}으로"),
+        ("联系john@example.com。", f"联系{R}。"),
+        # File names and git remotes are not addresses.
+        ("icon@2x.png", "icon@2x.png"),
+        ("see report@2x.PNG and logo@3x.webp", "see report@2x.PNG and logo@3x.webp"),
+        ("git@github.com:org/repo.git", "git@github.com:org/repo.git"),
+        ("ssh://git@gitlab.example.com/org/repo", "ssh://git@gitlab.example.com/org/repo"),
+        ("clone git@github.com:o/r.git, mail ann@corp.io", f"clone git@github.com:o/r.git, mail {R}"),
+        # ...but real TLDs that look like extensions still count, and so does a git mailbox.
+        ("a@b.zip", R),
+        ("mail git@example.com today", f"mail {R} today"),
+        ("ann@corp.io:hunter2", f"{R}:hunter2"),
     ],
 )
 def test_emails(text: str, expected: str) -> None:
@@ -73,9 +91,40 @@ def test_emails(text: str, expected: str) -> None:
         # does not hide the card.
         ("4111 1111 1111 1111 2 times", f"{R} 2 times"),
         ("1 4111 1111 1111 1111", f"1 {R}"),
-        # Separators must be single spaces or dashes.
+        ("4111111111111111 22", f"{R} 22"),
+        # Real groupings: 4-4-4-4-3, Diners 4-6-4, 4-4-4-2.
+        ("4111 1111 1111 1111 110", R),
+        ("3056 930902 5904", R),
+        ("3056 9309 0259 04", R),
+        # Separators: one character, all dash-like or all space-like.
+        ("4111\u20111111\u20111111\u20111111", R),  # U+2011 non-breaking hyphen
+        ("4111\u20101111\u20101111\u20101111", R),
+        ("4111\u20131111\u20131111\u20131111", R),  # en dash
+        ("4111\u20141111\u20141111\u20141111", R),  # em dash
+        ("4111\u22121111\u22121111\u22121111", R),  # minus sign
+        ("4111\u00a01111\u00a01111\u00a01111", R),  # NBSP
+        ("4111\u20071111\u20071111\u20071111", R),  # figure space
+        ("4111\u20091111\u20091111\u20091111", R),  # thin space
+        ("4111\u202f1111\u202f1111\u202f1111", R),  # narrow NBSP
+        ("4111-1111\u20111111\u20131111", R),  # different dashes are still dashes
+        ("4111 1111\u00a01111\u20091111", R),
+        ("4111-1111 1111-1111", "4111-1111 1111-1111"),
         ("4111  1111  1111  1111", "4111  1111  1111  1111"),
         ("4111--1111--1111--1111", "4111--1111--1111--1111"),
+        # Not a card grouping: the first group must have 4 digits, middle groups at least 4.
+        ("41111 1111 1111 111", "41111 1111 1111 111"),
+        ("4111 111 1111 11111", "4111 111 1111 11111"),
+        # A phone number before a card stays, and the whole card goes.
+        ("call 555 0100 4111 1111 1111 1111", f"call 555 0100 {R}"),
+        ("call 555 2100 4111 1111 1111 1111 now", f"call 555 2100 {R} now"),
+        # Luhn-valid runs of small numbers are not cards.
+        ("Primes: 2 3 5 7 11 13 17 19 23 29 31", "Primes: 2 3 5 7 11 13 17 19 23 29 31"),
+        ("2024-01-15 2024-02-15 2024-03-15", "2024-01-15 2024-02-15 2024-03-15"),
+        ("Fibonacci: 0 1 1 2 3 5 8 13 21 34 55 89 144", "Fibonacci: 0 1 1 2 3 5 8 13 21 34 55 89 144"),
+        ("1 0 1 1 0 0 1 0 1 1 1 0 1 0 0 1", "1 0 1 1 0 0 1 0 1 1 1 0 1 0 0 1"),
+        # Card numbers start with 2-6; other Luhn-valid numbers are ids.
+        ("order 1234567890123452", "order 1234567890123452"),
+        ("order 7234567890123459", "order 7234567890123459"),
     ],
 )
 def test_payment_cards(text: str, expected: str) -> None:
@@ -94,8 +143,20 @@ def test_payment_cards(text: str, expected: str) -> None:
         ("900-12-3456", "900-12-3456"),
         ("123-00-4567", "123-00-4567"),
         ("123-45-0000", "123-45-0000"),
-        # Mixed separators, glued digits and bare 9-digit numbers are not SSNs.
+        # Unicode dashes and spaces; both separators of the same kind.
+        ("123\u201145\u20116789", R),  # U+2011 non-breaking hyphen
+        ("123\u201045\u20106789", R),
+        ("123\u201345\u20136789", R),
+        ("123\u201445\u20146789", R),
+        ("123\u221245\u22126789", R),
+        ("123\u00a045\u00a06789", R),
+        ("123\u202f45\u202f6789", R),
+        ("123-45\u20116789", R),
+        ("123 45\u00a06789", R),
+        # Mixed separator kinds, glued digits and bare 9-digit numbers are not SSNs.
         ("123-45 6789", "123-45 6789"),
+        ("123-45\u00a06789", "123-45\u00a06789"),
+        ("123\u00a045\u20116789", "123\u00a045\u20116789"),
         ("1123-45-6789", "1123-45-6789"),
         ("123-45-67890", "123-45-67890"),
         ("123456789", "123456789"),
@@ -152,6 +213,28 @@ def test_complete_match_touching_the_end_is_held() -> None:
 
 def test_card_split_digit_by_digit() -> None:
     assert stream(list("pay 4111 1111 1111 1111 now")) == f"pay {R} now"
+    assert stream(list("pay 4111\u00a01111\u00a01111\u00a01111 now")) == f"pay {R} now"
+
+
+def test_unicode_separators_keep_a_digit_run_held() -> None:
+    redactor = StreamRedactor()
+    assert redactor.feed("ssn 123\u2011") == "ssn "
+    assert redactor.feed("45\u2011") == ""
+    assert redactor.feed("6789, ") == f"{R}, "
+
+
+def test_cjk_prose_is_not_held_back() -> None:
+    # No detector consumes CJK characters, so CJK text can never become part of a match.
+    redactor = StreamRedactor()
+    assert redactor.feed("请联系我们获取帮助") == "请联系我们获取帮助"
+    assert redactor.feed("的邮箱john") == "的邮箱"
+    assert redactor.feed("@example.com获取") == f"{R}获取"
+
+
+def test_a_git_remote_is_kept_whole_across_chunks() -> None:
+    remote = "git@github.com:org/repo.git"
+    for i in range(len(remote) + 1):
+        assert stream([remote[:i], remote[i:]]) == remote
 
 
 def test_rejected_candidate_is_released_once_decided() -> None:
@@ -192,6 +275,15 @@ def test_long_digit_run_is_not_held_forever() -> None:
     assert len(redactor.pending) <= LOCAL_MAX
 
 
+def test_the_longest_viable_prefix_fits_in_max_buffered() -> None:
+    # 64-char local part, "@", eight 63-char labels: the longest text that can still grow.
+    longest = "a" * LOCAL_MAX + "@" + ".".join(["b" * 63] * 8)
+    redactor = StreamRedactor()
+    assert redactor.feed("x " + longest) == "x "
+    assert redactor.buffered == MAX_BUFFERED == 577  # plus one character of context
+    assert redactor.flush() == R
+
+
 def test_buffer_stays_bounded_on_a_long_stream() -> None:
     redactor = StreamRedactor()
     piece = "user.name@mail.example.com 4111-1111-1111-1111 lorem ipsum 123-45-6789 "
@@ -214,6 +306,12 @@ def test_buffer_stays_bounded_on_a_long_stream() -> None:
         "a@b.c.d.e.f.g.h.i.j.com x@y.zz",
         "john@example.com.123 jürgen@exämple.de",
         "41111111111111105 4222222222222-1",
+        "4111\u20111111\u20111111\u20111111 and 123\u00a045\u00a06789",
+        "call 555 0100 4111 1111 1111 1111 110",
+        "2024-01-15 2024-02-15 3056 930902 5904",
+        "请联系john@example.com获取帮助",
+        "git@github.com:o/r.git icon@2x.png a@b.co",
+        "jose\u0301@exa\u0301mple.com 4111-1111\u20131111\u20111111",
     ],
 )
 def test_every_two_and_three_way_split_matches_one_shot(text: str) -> None:

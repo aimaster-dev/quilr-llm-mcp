@@ -135,9 +135,14 @@ redact("SSN 123-45-6789")  # "SSN [REDACTED]"
 
 | Type | Rule | False-positive control |
 |------|------|------------------------|
-| Email | `local@label.label…`: local part ≤ 64 chars of `[\w.%+-]`, 2–8 labels of ≤ 63 chars of `[\w-]`, Unicode letters allowed | Last label must be a TLD (≥ 2 letters, or `xn--` punycode); invalid trailing labels are trimmed (`john@example.com.123` keeps `.123`) |
-| Payment card | 13–19 digits, a single space or dash allowed between any two digits (`4111 1111 1111 1111`, `3782-822463-10005`) | **Luhn checksum**; not glued to other digits; must end on a digit-group boundary |
-| US SSN | `AAA-GG-SSSS` or `AAA GG SSSS`, consistent separator | Never-issued numbers rejected: area `000`/`666`/`9xx`, group `00`, serial `0000`; not glued to other digits |
+| Email | `local@label.label…`: local part ≤ 64 chars of word characters, `.%+-` and combining marks; 2–8 labels of ≤ 63 chars of word characters and `-`. Unicode letters are allowed (`jürgen@exämple.de`, NFC or NFD) except CJK: Han, Kana and Hangul end the address, so `请联系john@example.com获取` becomes `请联系[REDACTED]获取` | Last label must be a TLD: ≥ 2 letters and not a file extension (`icon@2x.png`), or `xn--` punycode. Invalid trailing labels are trimmed (`john@example.com.123` keeps `.123`). A git SSH remote (`git@github.com:org/repo.git`) is kept as is |
+| Payment card | 13–19 digits starting with 2–6 (Visa, Mastercard, Amex, Discover, JCB, Diners, UnionPay…), either contiguous or grouped as cards are printed: first group of 4 digits, every group but the last ≥ 4 (4-4-4-4, 4-4-4-4-3, Amex 4-6-5, Diners 4-6-4), one separator between groups, all dash-like or all space-like | **Luhn checksum**; not glued to other digits; the longest valid prefix that ends on a group boundary. So `2 3 5 7 11 13…`, dates and a phone number before a card are not cards |
+| US SSN | `AAA-GG-SSSS` or `AAA GG SSSS`: both separators dash-like or both space-like (`123-45 6789` is not an SSN) | Never-issued numbers rejected: area `000`/`666`/`9xx`, group `00`, serial `0000`; not glued to other digits |
+
+Separators are one shared class: ASCII space and hyphen-minus, plus what LLMs and word processors
+emit: U+2010 hyphen, **U+2011 non-breaking hyphen**, figure, en and em dashes, U+2212 minus, small
+and fullwidth hyphen-minus; NBSP, the U+2000–U+200A spaces (figure, thin…), U+202F narrow NBSP,
+U+205F and U+3000.
 
 Every match is replaced by `[REDACTED]`. The replacement string is configurable.
 
@@ -148,9 +153,12 @@ first detector that matches *and* passes its validator wins: the span is replace
 resumes after it. If none applies, scanning moves one character right. Two consequences:
 
 - An email that contains digits (`4111111111111111@example.com`) is redacted as one email.
-- In a long run of digit groups the leftmost group start wins, and from there the **longest
-  Luhn-valid run that ends on a group boundary**. So `4111 1111 1111 1111 2 times` becomes
-  `[REDACTED] 2 times` instead of leaking the card because the trailing `2` broke the checksum.
+- In a run of digit groups the leftmost group start that begins a card wins, and from there the
+  **longest Luhn-valid run that ends on a group boundary**. So `4111 1111 1111 1111 2 times`
+  becomes `[REDACTED] 2 times` instead of leaking the card because the trailing `2` broke the
+  checksum, and `call 555 0100 4111 1111 1111 1111` becomes `call 555 0100 [REDACTED]`.
+- A git remote is skipped as a whole, so `it@github.com` inside `git@github.com:…` is not
+  redacted either.
 
 ### How streaming works
 
@@ -171,11 +179,14 @@ resumes after it. If none applies, scanning moves one character right. Two conse
 #### Why decisions before the hold point are final
 
 The detector regexes only consume characters from small alphabets, every quantifier is bounded
-and **possessive** (no backtracking), and validators look at most one character past a match. If
-any detector, starting at position `s`, read up to the end of the buffer, the text from `s` would
-itself be a viable prefix, so `s` would be at or after the hold point. So every decision before the
-hold point uses only characters that are already in the buffer, and it is the decision one-shot
-redaction makes on the full text. This gives two invariants:
+and **possessive** (no backtracking), there are no lookaheads, and validators look at most one
+character past a match. If any detector, starting at position `s`, read up to the end of the
+buffer, it consumed everything from `s`, so that text would itself be a viable prefix and `s`
+would be at or after the hold point. So every decision before the hold point uses only characters
+that are already in the buffer, and it is the decision one-shot redaction makes on the full text.
+The tail patterns may over-approximate (accept more than a detector can consume): that only holds
+text a little longer. The email tail uses plain `\w` classes for speed and the held part is then
+cut at the last CJK character, which no detector consumes. This gives two invariants:
 
 | Invariant | Test |
 |-----------|------|
@@ -202,7 +213,7 @@ word, a partial email, or a partial digit group.
 
 | | Bound |
 |-|-------|
-| Held tail | ≤ 64 chars for a run of word characters without `@` (the longest possible local part), ≤ 576 for `local@domain`, ≤ 38 for digit groups. Prose: one word. |
+| Held tail | ≤ 64 chars for a run of word characters without `@` (the longest possible local part), ≤ 576 for `local@domain` (64 + 1 + 8 labels of 63 + 7 dots), ≤ 38 for digit groups (19 digits, 19 one-character separators). Prose: one word. CJK prose: nothing. |
 | Memory per stream | O(`MAX_BUFFERED`) = 577 chars per choice/field, plus one partial SSE line, independent of response length |
 | Work per `feed()` | O(len(chunk) + held tail). Candidates are found by C-level regex scans. `@` and number lookups are cached, so even one-shot redaction of a large text with many rejected candidates stays linear. |
 
@@ -284,11 +295,20 @@ What this shows:
   harmless for clients that concatenate deltas. Text split across two *different* fields is not
   joined. Redaction also shifts character offsets, so `annotations[].start_index`/`end_index`
   can point at the wrong text.
-- **Obfuscated PII** (`john at example dot com`, digits spelled out, homoglyphs, full-width digits)
-  is not detected. Only ASCII digits count for cards and SSNs.
+- **Obfuscated PII** (`john at example dot com`, digits spelled out, homoglyphs, full-width digits,
+  zero-width characters, Markdown inside the number such as `4111 **1111** …`) is not detected.
+  Only ASCII digits count for cards and SSNs, dots are not separators (`4111.1111.1111.1111`), and
+  a separator is one character (`4111  1111` with two spaces is two numbers).
+- **Separator kinds are not mixed.** `123-45 6789` or `4111-1111 1111-1111` is not matched; mixed
+  dashes (`-` and U+2011) or mixed spaces (space and NBSP) are.
 - **Bare 9-digit SSNs** (`123456789`) are not redacted. Without separators they cannot be told
-  apart from order numbers, ZIP+4 codes and so on.
+  apart from order numbers, ZIP+4 codes and so on. A phone number written `212 55 1234` has the
+  SSN shape and is redacted.
+- **Cards outside IIN 2–6** (UATP `1…`, some RuPay `8…`) and unusual groupings (a first group
+  other than 4 digits) are not detected. Among 2–6 numbers, roughly 1 in 10 random contiguous
+  13–19 digit ids passes Luhn and is redacted too.
+- **CJK addresses.** Because CJK text ends an address, an address written in CJK script
+  (`用户@例子.中国`) is not detected; its punycode form is. Only `git@…` remotes are recognised as
+  non-addresses; `deploy@host:/path` is still redacted.
 - Emails with more than 8 host labels or a local part longer than 64 characters are outside the
   grammar. For the latter, only the last 64 characters before `@` and the domain are redacted.
-- Card detection is checksum-based, so roughly 1 in 10 random 13–19 digit numbers that happen to
-  pass Luhn are redacted too.

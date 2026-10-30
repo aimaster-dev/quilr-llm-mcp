@@ -159,20 +159,19 @@ class ChatStreamRedactor:
 
     def __init__(self, replacement: str = REDACTED) -> None:
         self.replacement = replacement
-        # (choice index, stream key) -> redactor; insertion order is the flush order.
-        self._streams: dict[tuple[int, Path], StreamRedactor] = {}
-        self._paths: dict[tuple[int, Path], Path] = {}  # where the stream's text was last seen
+        # (choice index, stream key) -> stream; insertion order is the flush order.
+        self._streams: dict[tuple[int, Path], _Stream] = {}
         self._template: dict[str, Any] = {}  # id/object/created/model... for synthetic chunks
         self._closed_redactions = 0
 
     @property
     def redactions(self) -> int:
-        return self._closed_redactions + sum(r.redactions for r in self._streams.values())
+        return self._closed_redactions + sum(s.redactor.redactions for s in self._streams.values())
 
     @property
     def buffered(self) -> int:
         """Characters held across all choices and fields (for monitoring and tests)."""
-        return sum(r.buffered for r in self._streams.values())
+        return sum(s.redactor.buffered for s in self._streams.values())
 
     def process(self, event: SSEEvent) -> list[SSEEvent]:
         if event.data is None:
@@ -207,10 +206,9 @@ class ChatStreamRedactor:
         choices: list[Any] = chunk["choices"]
         ahead: list[dict[str, Any]] = []  # choices for synthetic chunks sent before this one
         held_back = False
-        one_shot = _Counter(self.replacement)
         for position, choice in enumerate(choices):
             if not isinstance(choice, dict):
-                choices[position] = one_shot.deep(choice)
+                choices[position] = self._one_shot(choice)
                 continue
             index = choice.get("index", position)
             if not isinstance(index, int):
@@ -220,8 +218,8 @@ class ChatStreamRedactor:
                     held_back |= self._redact_delta(index, value)
                 elif key == "logprobs":
                     choice[key] = None
-                elif key not in _CHOICE_KEYS:
-                    choice[key] = one_shot.fields(value)
+                elif key not in _CHOICE_KEYS and value is not None:
+                    choice[key] = self._one_shot(value)
             if choice.get("finish_reason") is None:
                 continue
             tails = self._flush_choice(index)
@@ -232,7 +230,6 @@ class ChatStreamRedactor:
             delta = choice.get("delta")
             ahead += _tail_choices(index, delta if isinstance(delta, dict) else {}, tails)
             choice["delta"] = {}
-        self._closed_redactions += one_shot.redactions
 
         out = self._synthetic(ahead)
         if held_back and _carries_nothing(chunk):
@@ -253,6 +250,13 @@ class ChatStreamRedactor:
                 chunks.append([choice])
         return [SSEEvent(data=_dumps({**self._template, "choices": group})) for group in chunks]
 
+    def _one_shot(self, value: Any) -> Any:
+        """Redact a complete value (no hold-back), keeping structural values."""
+        redact = _Counter(self.replacement)
+        value = redact.fields(value)
+        self._closed_redactions += redact.redactions
+        return value
+
     def _redact_delta(self, index: int, delta: dict[str, Any]) -> bool:
         """Redact a delta in place. True if some non-empty text was entirely held back."""
         held_back = False
@@ -260,11 +264,11 @@ class ChatStreamRedactor:
         def feed(path: Path, text: str) -> str:
             nonlocal held_back
             key = (index, _SAME_STREAM.get(path, path))
-            redactor = self._streams.get(key)
-            if redactor is None:
-                redactor = self._streams[key] = StreamRedactor(self.replacement)
-            self._paths[key] = path
-            out = redactor.feed(text)
+            stream = self._streams.get(key)
+            if stream is None:
+                stream = self._streams[key] = _Stream(self.replacement)
+            stream.path = path
+            out = stream.redactor.feed(text)
             held_back |= not out
             return out
 
@@ -274,13 +278,22 @@ class ChatStreamRedactor:
     def _flush_choice(self, index: int) -> list[tuple[Path, str]]:
         tails = []
         for key in [k for k in self._streams if k[0] == index]:
-            redactor = self._streams.pop(key)
-            path = self._paths.pop(key)
-            text = redactor.flush()
-            self._closed_redactions += redactor.redactions
+            stream = self._streams.pop(key)
+            text = stream.redactor.flush()
+            self._closed_redactions += stream.redactor.redactions
             if text:
-                tails.append((path, text))
+                tails.append((stream.path, text))
         return tails
+
+
+class _Stream:
+    """One text stream: its redactor, and the path its text was last seen at."""
+
+    __slots__ = ("path", "redactor")
+
+    def __init__(self, replacement: str) -> None:
+        self.redactor = StreamRedactor(replacement)
+        self.path: Path = ()
 
 
 def _tail_choices(index: int, delta: dict[str, Any], tails: list[tuple[Path, str]]) -> list[dict[str, Any]]:
