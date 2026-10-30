@@ -67,7 +67,12 @@ upstream bytes ─▶ SSEParser ─▶ ChatStreamRedactor ─▶ SSE bytes ─�
 
 - **Incremental SSE parsing.** Upstream bytes can split anywhere: inside a multi-byte UTF-8
   character (incremental decoder), between `\r` and `\n`, or mid-field. The parser keeps one
-  partial line and yields each event as soon as its blank line arrives.
+  partial line and yields each event as soon as its blank line arrives. Only new text is scanned
+  for line endings and a line spanning reads is joined once, so a long line in small reads costs
+  linear time (900 KB in 256-byte reads: 6 ms, was 9.7 s). One leading byte order mark is
+  stripped, as WHATWG requires. When an event exceeds `MAX_EVENT_SIZE`, the events completed
+  before it in the same read are still delivered, then the stream ends with
+  `upstream_invalid_stream`.
 - **Deny by default.** Every string under a choice's `delta` (or `message`) is treated as model
   output and redacted, whatever the field: `content` (a string or an array of content parts),
   `refusal`, `reasoning_content`, `reasoning`, `audio.transcript`, tool-call and legacy
@@ -234,7 +239,7 @@ word, a partial email, or a partial digit group.
 | Area | What is proven |
 |------|----------------|
 | Engine (`test_redaction*.py`) | Detector semantics; **streaming == one-shot for any chunking** (Hypothesis + exhaustive 2/3-way splits); buffer ≤ `MAX_BUFFERED` after every chunk; nothing held across `\n`; long runs released |
-| SSE (`test_sse.py`) | Same events for every byte split point, byte-by-byte and random splits (UTF-8, `\r\n`, `\r`) |
+| SSE (`test_sse.py`) | Same events for every byte split point, byte-by-byte and random splits (UTF-8, `\r\n`, `\r`, a leading BOM); a 900 KB line in 256-byte reads parses in linear time (timing guard); events before an oversized one are kept; a failed parser stays failed |
 | Chunk transformer (`test_completions.py`) | Every delta and message field redacted (content parts, reasoning, audio transcript, tool and legacy function arguments, unknown fields), structural values intact, logprobs dropped, tool calls keyed by `index`; Hypothesis: any interleaving of fields and choices reads as one-shot redaction, with nothing after `finish_reason`; `[DONE]`/EOF flush, dropped empty chunks |
 | Gateway (`test_gateway.py`) | Redacted SSE, credential handling, refused logprobs/audio, sanitized error mapping (non-2xx, lone surrogates, deep JSON, unexpected exceptions in-band and as a 500), mid-stream failure, **disconnect cancels upstream** before the status line, while reading a complete answer and while streaming |
 | Latency and memory (`test_streaming_latency.py`) | **First safe delta reaches the client while the upstream is blocked** waiting for it (a buffering gateway deadlocks); held text waits for one delta only; redactor peak < 64 chars over 5,000+ deltas; traced memory ~100 KB for a 1 MB stream |

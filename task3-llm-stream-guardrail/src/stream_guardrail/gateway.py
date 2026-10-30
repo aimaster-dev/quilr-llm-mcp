@@ -351,6 +351,7 @@ class Gateway:
         parser = SSEParser(self.settings.max_event_size)
         redactor = self.redactor_factory()
         error: GatewayError | None = None
+        complete: list[SSEEvent] = []  # events that were whole before the stream went bad
         first_event_ms: float | None = None
         try:
             try:
@@ -370,7 +371,8 @@ class Gateway:
                 error = _timeout_error()
             except httpx.HTTPError:
                 error = GatewayError(502, "upstream_stream_error", "The upstream stream was interrupted.")
-            except SSEError:
+            except SSEError as exc:
+                complete = exc.events  # e.g. good events in the same read as an oversized one
                 error = GatewayError(
                     502, "upstream_invalid_stream", "The upstream sent a malformed event stream."
                 )
@@ -381,13 +383,14 @@ class Gateway:
                     500, "internal_error", "The gateway failed while relaying the response.", "server_error"
                 )
             if error is not None:
-                # Release what was held (redacted as end-of-text), then report the failure in-band:
-                # the 200 status line has already been sent. If the redactor itself failed, its
-                # held text is dropped rather than risked.
+                # Deliver the events that were complete, release what was held (redacted as
+                # end-of-text), then report the failure in-band: the 200 status line has already
+                # been sent. If the redactor itself failed, its held text is dropped, not risked.
                 logger.warning("stream aborted: code=%s", error.code)
                 tail = b""
                 with contextlib.suppress(Exception):
-                    tail = b"".join(e.encode() for e in redactor.finish())
+                    out = [e for event in complete for e in redactor.process(event)]
+                    tail = b"".join(e.encode() for e in [*out, *redactor.finish()])
                 yield tail + error.event().encode()
         finally:
             await _close(upstream)

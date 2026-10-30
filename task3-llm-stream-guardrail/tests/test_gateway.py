@@ -11,6 +11,7 @@ import pytest
 from starlette.applications import Starlette
 
 from stream_guardrail.completions import ChatStreamRedactor
+from stream_guardrail.config import Settings
 from stream_guardrail.gateway import Gateway, create_app
 from stream_guardrail.redaction import REDACTED
 from stream_guardrail.sse import SSEEvent, SSEParser
@@ -373,6 +374,25 @@ async def test_mid_stream_failure_flushes_then_reports_in_band(make_gateway: Mak
     assert json.loads(events[-1].data or "")["error"]["code"] == "upstream_stream_error"
     assert all(event.data != "[DONE]" for event in events)
     assert b"10.0.0.7" not in raw
+
+
+async def test_events_in_the_same_read_as_an_oversized_one_are_delivered() -> None:
+    good = sse(completion_chunk(role="assistant", content=""), completion_chunk(content="Shipped to ann@ex"))
+    oversized = b"data: " + b"x" * 2000  # no line break: the event can only grow
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return sse_response([good + oversized])  # one network read carries all of it
+
+    settings = Settings(upstream_base_url=UPSTREAM_BASE, max_event_size=1000)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        app = create_app(settings, client)
+        async with asgi_request(app, PATH, STREAM_REQUEST) as response:
+            raw = await response.read()
+    events = events_of(raw)
+    # The good events, then the held "ann@ex" flushed as end-of-text, then the in-band error.
+    assert content_of(events[:-1]) == "Shipped to ann@ex"
+    assert json.loads(events[-1].data or "")["error"]["code"] == "upstream_invalid_stream"
+    assert b"xxxx" not in raw
 
 
 async def test_client_disconnect_cancels_the_upstream_request(make_gateway: MakeGateway) -> None:
