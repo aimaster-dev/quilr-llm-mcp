@@ -91,14 +91,26 @@ upstream bytes ─▶ SSEParser ─▶ ChatStreamRedactor ─▶ SSE bytes ─�
   in any field goes out in a synthetic chunk **just before** it (same `id`/`model`/`created`), and
   the finish chunk keeps an empty delta. The same happens before `data: [DONE]` and at EOF, so
   clients that stop reading at either point miss nothing.
-- **No extra latency.** Each event is written to the client as soon as it is redacted, even when
-  one upstream read carried many. Chunks whose text is entirely held back, and that carry nothing
-  else (no role, id, `finish_reason`, `usage` or other choice data), are dropped instead of being
-  sent empty. Comments (`: keep-alive`) and other non-content events pass through.
+- **Latency: the trailing word waits for the next delta.** Each event is written to the client as
+  soon as it is redacted, even when one upstream read carried many, but the end of each delta that
+  could still grow into a match is held until more text arrives: the last word (`today` could
+  become `today@example.com`), a partial number or a partial address. With token-sized deltas
+  that is most of them: on LLM-like prose split into BPE-style tokens (a word with its leading
+  space per delta), only 12% of deltas are forwarded whole on arrival and 80% of characters leave
+  one delta later. A run of address characters spread over several tokens waits longer, up to 5
+  deltas for `version 2.3.1`. At 20 ms per token that is 20 ms for most words. Nothing waits
+  beyond the next character that cannot be part of a match (a space after a word, punctuation, a
+  newline), and CJK text is never held. Chunks whose text is entirely held back, and that carry
+  nothing else (no role, id, `finish_reason`, `usage` or other choice data), are dropped instead of
+  being sent empty. Comments (`: keep-alive`) and other non-content events pass through.
 - **Non-streaming** (`"stream": false`): the same deny-by-default rules apply to
-  `choices[].message`, one shot.
-- **Payloads it does not recognise** (a mid-stream `{"error": …}`, non-JSON `data:`) are redacted
-  as plain text rather than passed through.
+  `choices[].message`, one shot. A JSON answer to a streaming request is handled the same way.
+- **Payloads it does not recognise** (a mid-stream `{"error": …}`, non-JSON `data:`, a provider
+  whose events have no `choices`, such as TGI's `{"token": {"text": …}}`) are redacted as plain
+  text rather than passed through. Such events are redacted **one at a time**: the gateway does
+  not know which of their fields continue across events, so a pattern split between two of them
+  (`"mail john@exa"`, `"mple.com"`) is not caught. Only the OpenAI `choices` shape is streamed
+  with hold-back.
 - **Client disconnect cancels the upstream request** immediately, in every phase: while the
   provider is still thinking (no status line sent yet), while a non-streaming answer is being
   read, and while a stream is relayed. The endpoint is a plain ASGI app: once the request body is
@@ -116,22 +128,36 @@ upstream bytes ─▶ SSEParser ─▶ ChatStreamRedactor ─▶ SSE bytes ─�
 ### Errors
 
 Upstream bodies, exception text and internal addresses never reach the client. Errors use
-OpenAI's shape: `{"error": {"message", "type", "param", "code"}}`.
+OpenAI's shape: `{"error": {"message", "type", "param", "code"}}`, with a fixed message per code.
 
-| Situation | Client gets |
-|-----------|-------------|
-| Body is not JSON (or nested too deeply to parse), or not an object / too large | 400 `invalid_json` / `invalid_request`, 413 `request_too_large` (upstream not called) |
-| `logprobs` / `top_logprobs` requested | 400 `logprobs_not_supported`, `param` names the field (upstream not called) |
-| Audio output requested (`modalities`, `audio`) | 400 `audio_not_supported` (upstream not called) |
-| Upstream 400/404/409/413/415/422 | Same status, `upstream_rejected_request`, plus `upstream_code` if the provider sent a safe machine-readable code such as `model_not_found` |
-| Upstream 401/403 (the gateway's key) | 502 `upstream_auth_failed` |
-| Upstream 429 | 429 `rate_limited`, `Retry-After` passed through if it is a plain token |
-| Upstream 408/504, connect/read timeout | 504 `upstream_timeout` |
-| Upstream 5xx, connection refused | 502 `upstream_error` / `upstream_unavailable` |
-| Upstream 3xx (redirects are never followed) or any other non-2xx | 502 `upstream_error`; no `Location`, no body |
-| Unexpected gateway error before the response started | 500 `internal_error` (`type: server_error`) |
-| Failure **after** streaming started | Held text is flushed (redacted), then `data: {"error": {…"code":"upstream_stream_error"}}`; no `[DONE]` |
-| Unexpected gateway error **after** streaming started | Held text is flushed (if the redactor can), then an in-band `internal_error` event; no `[DONE]` |
+**Before the response starts** the client gets an HTTP error:
+
+| Situation | Status | `code` | `type` |
+|-----------|-------:|--------|--------|
+| Body is not JSON, or nested too deeply to parse (upstream not called) | 400 | `invalid_json` | `invalid_request_error` |
+| Body is not a JSON object (upstream not called) | 400 | `invalid_request` | `invalid_request_error` |
+| Body larger than `MAX_REQUEST_BYTES` (upstream not called) | 413 | `request_too_large` | `invalid_request_error` |
+| `logprobs` / `top_logprobs` requested; `param` names the field (upstream not called) | 400 | `logprobs_not_supported` | `invalid_request_error` |
+| Audio output requested: `modalities` with `audio`, or `audio` (upstream not called) | 400 | `audio_not_supported` | `invalid_request_error` |
+| Upstream 400/404/409/413/415/422; `upstream_code` added if the provider sent a safe machine-readable code such as `model_not_found` | same | `upstream_rejected_request` | `invalid_request_error` |
+| Upstream 401/403: the gateway's own key was rejected | 502 | `upstream_auth_failed` | `upstream_error` |
+| Upstream 429; `Retry-After` passed through if it is a plain token | 429 | `rate_limited` | `rate_limit_error` |
+| Upstream 408/504, connect or read timeout before the answer | 504 | `upstream_timeout` | `upstream_error` |
+| Connection refused, DNS failure, other transport error | 502 | `upstream_unavailable` | `upstream_error` |
+| Upstream 5xx, 3xx (redirects are never followed; no `Location`, no body) or any other non-2xx | 502 | `upstream_error` | `upstream_error` |
+| Upstream 2xx whose complete answer is not JSON (HTML, empty 204, nested too deeply) | 502 | `upstream_invalid_response` | `upstream_error` |
+| Complete answer larger than `MAX_RESPONSE_BYTES` | 502 | `upstream_response_too_large` | `upstream_error` |
+| Unexpected gateway error (a bug), also via the app-level handler | 500 | `internal_error` | `server_error` |
+
+**After streaming started** the status line (200) is already out. Held text is flushed (redacted
+as end-of-text), then one `data: {"error": {…}}` event ends the stream, without `[DONE]`:
+
+| Situation | `code` in the error event |
+|-----------|---------------------------|
+| No upstream read for `READ_TIMEOUT` seconds | `upstream_timeout` |
+| Upstream connection dropped or reset | `upstream_stream_error` |
+| An event larger than `MAX_EVENT_SIZE` (events completed before it are delivered first) | `upstream_invalid_stream` |
+| Unexpected gateway error while relaying (held text is flushed only if the redactor can) | `internal_error` |
 
 ## Redaction engine
 
@@ -233,17 +259,17 @@ word, a partial email, or a partial digit group.
 
 ## Tests
 
-`pytest` runs 129 tests in about 6 s, deterministic and with no fixed ports.
+`pytest` runs 253 tests in about 8 s, deterministic and with no fixed ports.
 `HYPOTHESIS_PROFILE=thorough pytest` runs 20,000 random examples per property.
 
 | Area | What is proven |
 |------|----------------|
-| Engine (`test_redaction*.py`) | Detector semantics; **streaming == one-shot for any chunking** (Hypothesis + exhaustive 2/3-way splits); buffer ≤ `MAX_BUFFERED` after every chunk; nothing held across `\n`; long runs released |
+| Engine (`test_redaction*.py`) | Detector semantics, including Unicode separators, card groupings, IIN, false-positive regressions (number lists, dates, a phone before a card), CJK boundaries, file names and git remotes; **streaming == one-shot for any chunking** (Hypothesis with the new separators, CJK, NBSP and combining marks in its alphabets, plus exhaustive 2/3-way splits); buffer ≤ `MAX_BUFFERED` after every chunk and exactly `MAX_BUFFERED` at the worst case; nothing held across `\n`; CJK prose never held; long runs released |
 | SSE (`test_sse.py`) | Same events for every byte split point, byte-by-byte and random splits (UTF-8, `\r\n`, `\r`, a leading BOM); a 900 KB line in 256-byte reads parses in linear time (timing guard); events before an oversized one are kept; a failed parser stays failed |
 | Chunk transformer (`test_completions.py`) | Every delta and message field redacted (content parts, reasoning, audio transcript, tool and legacy function arguments, unknown fields), structural values intact, logprobs dropped, tool calls keyed by `index`; Hypothesis: any interleaving of fields and choices reads as one-shot redaction, with nothing after `finish_reason`; `[DONE]`/EOF flush, dropped empty chunks |
 | Gateway (`test_gateway.py`) | Redacted SSE, credential handling, refused logprobs/audio, sanitized error mapping (non-2xx, lone surrogates, deep JSON, unexpected exceptions in-band and as a 500), mid-stream failure, **disconnect cancels upstream** before the status line, while reading a complete answer and while streaming |
-| Latency and memory (`test_streaming_latency.py`) | **First safe delta reaches the client while the upstream is blocked** waiting for it (a buffering gateway deadlocks); held text waits for one delta only; redactor peak < 64 chars over 5,000+ deltas; traced memory ~100 KB for a 1 MB stream |
-| Real sockets (`test_end_to_end.py`) | Same guarantees over uvicorn + loopback TCP, including disconnect cancellation; a raw socket closed while the provider is still thinking (streaming or not) makes the gateway hang up on the provider |
+| Latency and memory (`test_streaming_latency.py`) | **First safe delta reaches the client while the upstream is blocked** waiting for it (a buffering gateway deadlocks); held text waits for one delta only; within a burst, the event loop runs after every event written; redactor peak < 64 chars over 5,000+ deltas; traced memory ~100 KB for a 1 MB stream |
+| Real sockets (`test_end_to_end.py`) | Same guarantees over uvicorn + loopback TCP, including disconnect cancellation; a raw socket closed while the provider is still thinking (streaming or not) makes the gateway hang up on the provider; a provider that goes silent mid-stream gets an in-band `upstream_timeout` after `READ_TIMEOUT`; `n=3` interleaved choices each read as one-shot redaction |
 
 `httpx.ASGITransport` buffers the whole response, so it cannot show streaming. The tests drive the
 gateway through the raw ASGI interface (`tests/asgi.py`) and reach the mock provider through
@@ -253,57 +279,70 @@ with backpressure.
 ## Benchmarks
 
 ```bash
-python benchmarks/bench_redactor.py     # ~1 min; --quick for a smoke run
+python benchmarks/bench_redactor.py     # about 35 s; --quick for a smoke run
 ```
 
-Measured on a busy Windows 11 laptop, Python 3.12. For section 3, the servers run in a child
-process and every path is hit in interleaved order.
+Measured on a busy Windows 11 laptop, Python 3.12. For section 3, the mock and both gateways run
+on uvicorn in a child process, so the client's timing is not skewed by the servers' work, and
+every path is hit in interleaved order.
 
 **1. Engine** (`StreamRedactor.feed()`, 200 KB of LLM-like text with PII about every KB):
 
 | chunk size | µs per chunk | of which redaction | throughput |
 |---:|---:|---:|---:|
-| 1 char | 1.07 | 1.04 | 0.9 MB/s |
-| 4 chars (≈ 1 token) | 1.22 | 1.19 | 3.3 MB/s |
-| 64 chars | 4.31 | 4.28 | 14.9 MB/s |
-| 4 KB | 207 | 207 | 19.7 MB/s |
+| 1 char | 1.04 | 1.01 | 1.0 MB/s |
+| 4 chars (≈ 1 token) | 1.15 | 1.12 | 3.5 MB/s |
+| 64 chars | 4.09 | 4.07 | 15.6 MB/s |
+| 4 KB | 205 | 205 | 19.9 MB/s |
 
 **2. Gateway pipeline per upstream event** (4-char deltas): 3.0 µs to parse and re-encode the SSE
-event, 9.3 µs with JSON and redaction, so **the guardrail adds about 6 µs of CPU per token**. A
-model emitting 100 tokens/s costs under 0.1 % of a core.
+event, 9.7 µs with JSON and redaction of every field of the delta, so **the guardrail adds about
+7 µs of CPU per token**. A model emitting 100 tokens/s costs under 0.1 % of a core.
 
 **3. End to end over loopback TCP** (p50 / p95 ms, 200 unpaced and 20 paced requests per path):
 
 | path | first byte | first content | total |
 |---|---:|---:|---:|
 | *mock answers instantly* | | | |
-| direct to mock | 3.95 / 5.64 | 4.00 / 5.89 | 6.69 / 10.20 |
-| gateway, redaction off | 7.16 / 11.94 | 11.07 / 17.66 | 13.92 / 21.62 |
-| gateway, redaction on | 7.12 / 12.77 | 12.20 / 20.57 | 14.55 / 24.53 |
+| direct to mock | 1.74 / 2.81 | 1.77 / 2.84 | 2.94 / 4.54 |
+| gateway, redaction off | 3.25 / 4.06 | 3.31 / 4.14 | 7.44 / 8.91 |
+| gateway, redaction on | 3.28 / 4.68 | 3.41 / 4.83 | 7.81 / 9.45 |
 | *TTFT 50 ms, then a 4-char delta every 20 ms* | | | |
-| direct to mock | 66.30 / 73.87 | 66.73 / 74.16 | 410.05 / 423.33 |
-| gateway, redaction off | 71.27 / 75.65 | 71.51 / 76.32 | 417.18 / 426.28 |
-| gateway, redaction on | 69.29 / 81.35 | 99.98 / 112.09 | 417.91 / 435.16 |
+| direct to mock | 59.32 / 76.37 | 59.47 / 76.60 | 403.68 / 417.53 |
+| gateway, redaction off | 60.78 / 76.89 | 61.06 / 77.23 | 406.22 / 430.78 |
+| gateway, redaction on | 59.16 / 75.58 | 88.64 / 106.04 | 402.08 / 421.18 |
 
 What this shows:
 
 - **Time to first byte does not change** with redaction on. The role chunk is forwarded as soon as
-  it arrives. The proxy hop itself (uvicorn + httpx on Windows loopback) costs about 3 ms.
-- **Total stream time does not change** either: about 0.6 ms more over 65 deltas when the upstream
-  is instant, and within noise at realistic pacing.
+  it arrives. The proxy hop itself (uvicorn + httpx on Windows loopback) costs about 1.5 ms.
+- **A burst is forwarded event by event.** When the mock answers instantly, one upstream read
+  carries most of the answer. A server's `send()` usually returns without yielding, and on
+  asyncio's Proactor loop (Windows) only the first write then reaches the socket until the loop
+  runs again, so the whole burst used to be redacted before anything went out (first content
+  6.1 ms with redaction, 5.3 ms without, in the previous version). The relay now lets the loop run
+  after each event: first content 3.4 ms. The price is one loop iteration per event: the total for
+  65 instant deltas went from 7.3 to 7.8 ms with redaction (6.6 to 7.4 ms without). Redaction
+  itself adds about 0.4 ms to it; at realistic pacing total time is within noise.
 - **First content can arrive one delta later.** The mock's first delta is `Sure`, which could still
   become `Sure@example.com`, so it waits for `! He` (20 ms here, plus Windows timer granularity).
   This is the minimum price of never leaking a pattern split across chunks. A first delta that ends
-  in a space or punctuation is forwarded at once (`test_first_safe_chunk…`).
+  in a space or punctuation is forwarded at once (`test_first_safe_chunk…`). The same wait applies
+  to the last word of each delta (see *Latency* above).
 
 ## Known limitations
 
 - **Request side is not filtered.** Only the model's output is redacted; prompts go upstream
   unchanged. Client authentication is also out of scope: run the gateway behind your API gateway.
+- **Output that cannot be redacted as text is refused**, not filtered: token `logprobs` and audio
+  output get a 400.
+- **Streams without `choices` are redacted per event.** For a provider that does not speak the
+  OpenAI chunk format (TGI's `{"token": {"text": …}}`, say), each event is redacted on its own, so
+  a pattern split across two events is not caught.
 - **Tool-call arguments are redacted as text.** `{"email": "a@b.co"}` stays valid JSON, but a card
   number written as a bare JSON number becomes `[REDACTED]` and makes the arguments invalid JSON.
   This is deliberate: breaking the call beats leaking the number. JSON-escaped PII
-  (`a@b.co`) is not decoded first.
+  (`a\u0040b.co`) is not decoded first.
 - **Unknown fields are treated as text streams.** A string field the gateway does not know (an
   annotation URL, say) may have its last word held back and delivered in a later chunk, which is
   harmless for clients that concatenate deltas. Text split across two *different* fields is not

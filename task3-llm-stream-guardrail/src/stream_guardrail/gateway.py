@@ -26,6 +26,7 @@ from typing import Any
 
 import anyio
 import httpx
+from anyio.lowlevel import checkpoint
 from starlette.applications import Starlette
 from starlette.requests import ClientDisconnect, Request
 from starlette.responses import Response
@@ -337,6 +338,11 @@ class Gateway:
             await send({"type": "http.response.start", "status": 200, "headers": _SSE_HEADERS})
             async for chunk in events:
                 await send({"type": "http.response.body", "body": chunk, "more_body": True})
+                # A server's send() usually returns without yielding. On asyncio's Proactor loop
+                # (Windows) only the first write of a burst then reaches the socket, and the rest
+                # waits until the whole upstream read has been redacted. Letting the loop run
+                # after each event puts every event on the wire as soon as it is ready.
+                await checkpoint()
             await send({"type": "http.response.body", "body": b"", "more_body": False})
         except OSError:
             logger.info("client disconnected during the stream")

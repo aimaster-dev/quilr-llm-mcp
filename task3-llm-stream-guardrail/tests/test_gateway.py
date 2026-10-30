@@ -626,6 +626,55 @@ async def test_non_2xx_and_bodyless_answers_are_sanitized(
         assert b"internal.example" not in raw
 
 
+@pytest.mark.parametrize("content_type", ["text/html", "text/plain", "application/json"])
+async def test_a_2xx_answer_that_is_not_json_is_sanitized(
+    make_gateway: MakeGateway, content_type: str
+) -> None:
+    # A proxy's error page, or an SSE body without the event-stream content type.
+    page = b'<html>Bad gateway for john@example.com</html>\ndata: {"choices": []}\n\n'
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": content_type}, content=page)
+
+    app, _ = make_gateway(handler)
+    for request_body in (STREAM_REQUEST, PLAIN_REQUEST):
+        async with asgi_request(app, PATH, request_body) as response:
+            raw = await response.read()
+        assert response.status == 502
+        assert json.loads(raw)["error"] == {
+            "message": "The upstream response is not valid JSON.",
+            "type": "upstream_error",
+            "param": None,
+            "code": "upstream_invalid_response",
+        }
+        assert b"john" not in raw
+
+
+async def test_a_complete_answer_over_the_size_limit_is_refused() -> None:
+    answer = {"choices": [{"index": 0, "message": {"content": "x" * 50_000 + " john@example.com"}}]}
+    chunks_sent = 0
+
+    async def body() -> AsyncIterator[bytes]:
+        nonlocal chunks_sent
+        raw = json.dumps(answer).encode()
+        for i in range(0, len(raw), 1000):
+            chunks_sent += 1
+            yield raw[i : i + 1000]
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "application/json"}, content=body())
+
+    settings = Settings(upstream_base_url=UPSTREAM_BASE, max_response_bytes=4096)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        app = create_app(settings, client)
+        async with asgi_request(app, PATH, PLAIN_REQUEST) as response:
+            raw = await response.read()
+    assert response.status == 502
+    assert json.loads(raw)["error"]["code"] == "upstream_response_too_large"
+    assert b"john" not in raw
+    assert chunks_sent == 5  # reading stopped as soon as the limit was crossed (of 51 chunks)
+
+
 async def test_comments_are_forwarded_as_keep_alives(make_gateway: MakeGateway) -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return sse_response([b": keep-alive\n\n", content_stream("hi")])

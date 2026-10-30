@@ -6,12 +6,14 @@ driven through the raw ASGI interface, so the tests see each write the moment th
 
 from __future__ import annotations
 
+import itertools
 import json
 import tracemalloc
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 
 import anyio
+import anyio.lowlevel
 import httpx
 import pytest
 from starlette.applications import Starlette
@@ -104,6 +106,69 @@ async def test_text_held_back_waits_only_for_the_next_delta() -> None:
                     released.set()
     assert seen == ["Sure! "]  # upstream sent "Sure" and "! Do"; the client already has "Sure! "
     assert reader.text == "Sure! Done."
+
+
+async def test_each_event_of_a_burst_is_handed_over_before_the_next_is_redacted() -> None:
+    # One upstream read carries a whole answer. A real server's send() returns without yielding,
+    # so unless the relay lets the event loop run after each write, the server (asyncio's
+    # Proactor loop on Windows, for one) puts nothing but the first write on the wire until the
+    # whole burst has been redacted. Observe that with a task that counts loop iterations.
+    burst = b"".join(
+        b"data: "
+        + json.dumps({"choices": [{"index": 0, "delta": {"content": f"word{i} "}}]}).encode()
+        + b"\n\n"
+        for i in range(50)
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=burst)
+
+    ticks = 0
+    seen_at: list[int] = []
+    body = json.dumps(REQUEST).encode()
+    sent_request = False
+
+    async def receive() -> dict[str, object]:
+        nonlocal sent_request
+        if not sent_request:
+            sent_request = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        await anyio.sleep_forever()
+        raise AssertionError("unreachable")
+
+    async def send(message: dict[str, object]) -> None:  # like uvicorn: no await, no yield
+        if message["type"] == "http.response.body" and message.get("body"):
+            seen_at.append(ticks)
+
+    async def tick() -> None:
+        nonlocal ticks
+        while True:
+            ticks += 1
+            await anyio.lowlevel.checkpoint()
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.4"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": PATH,
+        "raw_path": PATH.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())],
+        "client": ("127.0.0.1", 50000),
+        "server": ("testserver", 80),
+    }
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as upstream:
+        app = create_app(Settings(upstream_base_url="http://mock/v1"), upstream)
+        with anyio.fail_after(10):
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(tick)
+                await app(scope, receive, send)  # type: ignore[arg-type]
+                tg.cancel_scope.cancel()
+    assert len(seen_at) >= 50
+    assert all(b > a for a, b in itertools.pairwise(seen_at)), seen_at
 
 
 class RecordingRedactor(ChatStreamRedactor):
