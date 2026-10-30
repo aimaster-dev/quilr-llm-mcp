@@ -9,10 +9,13 @@ description = "Streaming PII guardrail for LLM responses: incremental redaction 
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-  "starlette>=0.40",
-  "httpx>=0.27",
-  "uvicorn>=0.30",
-  "anyio>=4.4",
+  "starlette>=0.40,<2",
+  "httpx>=0.27,<1",
+  "uvicorn>=0.30,<1",
+  "anyio>=4.4,<5",
+  # Transitive (uvicorn, httpcore), pinned here as a security floor: h11 < 0.16 is
+  # GHSA-vqfr-h8mv-ghfj (lenient chunked-encoding parsing, request smuggling).
+  "h11>=0.16,<1",
 ]
 
 [project.optional-dependencies]
