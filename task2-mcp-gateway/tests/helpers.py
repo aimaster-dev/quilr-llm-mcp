@@ -178,11 +178,13 @@ def serve_wsgi_in_thread(app: WSGIApplication) -> Iterator[str]:
 
 
 @contextmanager
-def serve_in_thread(app: ASGIApp) -> Iterator[str]:
-    """Serve `app` with uvicorn on an ephemeral localhost port in a background thread; yield its URL."""
-    config = uvicorn.Config(
-        app, host="127.0.0.1", port=0, log_config=None, log_level="warning", timeout_graceful_shutdown=2
-    )
+def serve_in_thread(app: ASGIApp, **options: Any) -> Iterator[str]:
+    """Serve `app` with uvicorn on an ephemeral localhost port in a background thread; yield its URL.
+
+    `options` override the uvicorn.Config defaults used here.
+    """
+    defaults: dict[str, Any] = {"log_config": None, "log_level": "warning", "timeout_graceful_shutdown": 2}
+    config = uvicorn.Config(app, host="127.0.0.1", port=0, **{**defaults, **options})
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, name="uvicorn-test-server", daemon=True)
     thread.start()

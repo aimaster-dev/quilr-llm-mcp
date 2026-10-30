@@ -21,6 +21,7 @@ RequestId = str | int
 PARSE_ERROR = -32700
 INVALID_REQUEST = -32600
 INVALID_PARAMS = -32602
+INTERNAL_ERROR = -32603
 
 # Gateway codes, from the implementation-defined server-error band (-32000..-32019).
 UNAUTHORIZED_TOOL_CALL = -32001

@@ -27,12 +27,12 @@ from dataclasses import dataclass
 import anyio
 import httpx
 from starlette.applications import Starlette
-from starlette.requests import Request
+from starlette.requests import ClientDisconnect, Request
 from starlette.responses import Response
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
-from mcp_gateway.audit import AuditRecord
+from mcp_gateway.audit import AuditRecord, Outcome
 from mcp_gateway.auth import AuthenticationError, Identity, Role, TokenVerifier, bearer_token
 from mcp_gateway.config import GatewaySettings
 from mcp_gateway.jsonrpc import (
@@ -40,6 +40,7 @@ from mcp_gateway.jsonrpc import (
     DOWNSTREAM_TIMEOUT,
     DOWNSTREAM_UNAVAILABLE,
     GATEWAY_BUSY,
+    INTERNAL_ERROR,
     INVALID_REQUEST,
     TOO_MANY_STREAMS,
     UNAUTHORIZED_TOOL_CALL,
@@ -226,10 +227,16 @@ async def read_body(request: Request, limit: int) -> bytes:
         if int(declared) > limit:
             raise too_large
     body = bytearray()
-    async for chunk in request.stream():
-        body += chunk
-        if len(body) > limit:
-            raise too_large
+    try:
+        async for chunk in request.stream():
+            body += chunk
+            if len(body) > limit:
+                raise too_large
+    except ClientDisconnect as exc:
+        # Nobody is left to answer, but the request is still refused and audited like any other.
+        raise JsonRpcError(
+            INVALID_REQUEST, "Request body incomplete: the client disconnected", detail="client_disconnected"
+        ) from exc
     return bytes(body)
 
 
@@ -319,12 +326,27 @@ class Gateway:
             await response(scope, receive, send)
 
     async def handle(self, request: Request, on_finish: AsyncExitStack) -> Response:
-        """Admit or refuse the request (one audit line either way), then forward it.
+        """Admit or refuse the request (one decision line either way), then forward it.
 
         Resources the request holds until its response has been relayed (a stream slot) are
         registered on `on_finish`.
         """
         record = AuditRecord(request_id=uuid.uuid4().hex, http_method=request.method)
+        try:
+            return await self._handle(request, record, on_finish)
+        except Exception:
+            # Last resort, for a bug: the client learns nothing about it, and the request is
+            # still audited. The traceback goes to the operational log only.
+            logger.exception("unexpected error while handling request %s", record.request_id)
+            reply_id = record.rpc_id if record.method is not None else None
+            error = JsonRpcError(INTERNAL_ERROR, "Internal error", http_status=500, rpc_id=reply_id)
+            if record.decided:
+                record.emit_outcome("internal_error", status=500, code=INTERNAL_ERROR)
+            else:
+                record.emit("reject", "internal_error", status=500, code=INTERNAL_ERROR)
+            return error_response(error)
+
+    async def _handle(self, request: Request, record: AuditRecord, on_finish: AsyncExitStack) -> Response:
         try:
             identity = self.authenticate(request)
             record.subject, record.role = identity.subject, identity.role.value
@@ -334,11 +356,9 @@ class Gateway:
             record.emit(verdict, error.detail or error.message, status=error.http_status, code=error.code)
             return error_response(error)
 
+        # Written before anything is forwarded; the outcome line follows once the downstream answers.
         record.emit("allow", admitted.reason)
-        try:
-            return await self.forward(request, identity, record.request_id, admitted)
-        except JsonRpcError as error:
-            return error_response(error)
+        return await self.forward(request, identity, record, admitted)
 
     def authenticate(self, request: Request) -> Identity:
         """Verify the bearer token, before anything else about the request is looked at."""
@@ -404,16 +424,18 @@ class Gateway:
         return Admitted(content=message.canonical, rpc_id=rpc_id, reason=decision.reason)
 
     async def forward(
-        self, request: Request, identity: Identity, request_id: str, admitted: Admitted
+        self, request: Request, identity: Identity, record: AuditRecord, admitted: Admitted
     ) -> Response:
-        """Send the request downstream and relay the response; transport failures become 502/503/504."""
-        rpc_id = admitted.rpc_id
+        """Send the request downstream and relay the response; transport failures become 502/503/504.
+
+        Either way, the outcome line goes to the audit log.
+        """
         headers = request_headers_to_forward(request.headers.raw)
         headers += [
             (b"accept-encoding", b"identity"),
             (SUBJECT_HEADER.encode(), identity.subject.encode()),
             (ROLE_HEADER.encode(), identity.role.value.encode()),
-            (REQUEST_ID_HEADER.encode(), request_id.encode()),
+            (REQUEST_ID_HEADER.encode(), record.request_id.encode()),
         ]
         # POST responses may be SSE too, but each ends once the downstream has answered, and the
         # read timeout bounds silence on it. Only GET streams are open-ended.
@@ -428,24 +450,29 @@ class Gateway:
         )
         try:
             upstream = await client.send(upstream_request, stream=True)
-        except httpx.PoolTimeout as exc:
-            # Every pooled connection is busy. Not the downstream's fault: say so, and say retry.
-            logger.warning("downstream %s waited too long for a pooled connection: %r", request.method, exc)
-            raise JsonRpcError(
-                GATEWAY_BUSY, "Gateway busy: too many concurrent requests", http_status=503, rpc_id=rpc_id
-            ) from exc
-        except httpx.TimeoutException as exc:
-            logger.warning("downstream %s timed out: %r", request.method, exc)
-            raise JsonRpcError(
-                DOWNSTREAM_TIMEOUT, "Downstream MCP server timed out", http_status=504, rpc_id=rpc_id
-            ) from exc
         except httpx.RequestError as exc:
             logger.warning("downstream %s failed: %r", request.method, exc)
-            raise JsonRpcError(
-                DOWNSTREAM_UNAVAILABLE, "Downstream MCP server is unavailable", http_status=502, rpc_id=rpc_id
-            ) from exc
+            outcome, error = transport_failure(exc, admitted.rpc_id)
+            record.emit_outcome(outcome, status=error.http_status, code=error.code, reason=type(exc).__name__)
+            return error_response(error)
         logger.debug("%s %s -> %d", request.method, MCP_PATH, upstream.status_code)
+        record.emit_outcome("forwarded", status=upstream.status_code)
         return StreamedResponse(upstream)
+
+
+def transport_failure(exc: httpx.RequestError, rpc_id: RequestId | None) -> tuple[Outcome, JsonRpcError]:
+    """The reply to a request the downstream never answered. Internal details stay in the log."""
+    if isinstance(exc, httpx.PoolTimeout):
+        # Every pooled connection is busy: the gateway's own limit, not a slow downstream.
+        message = "Gateway busy: too many concurrent requests"
+        return "gateway_busy", JsonRpcError(GATEWAY_BUSY, message, http_status=503, rpc_id=rpc_id)
+    if isinstance(exc, httpx.TimeoutException):
+        message = "Downstream MCP server timed out"
+        return "downstream_timeout", JsonRpcError(DOWNSTREAM_TIMEOUT, message, http_status=504, rpc_id=rpc_id)
+    message = "Downstream MCP server is unavailable"
+    return "downstream_unavailable", JsonRpcError(
+        DOWNSTREAM_UNAVAILABLE, message, http_status=502, rpc_id=rpc_id
+    )
 
 
 def create_app(settings: GatewaySettings, *, transport: httpx.AsyncBaseTransport | None = None) -> Starlette:
