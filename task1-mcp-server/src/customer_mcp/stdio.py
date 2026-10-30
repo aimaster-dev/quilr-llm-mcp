@@ -12,10 +12,15 @@ Over stdio, stdout *is* the JSON-RPC wire: one message per line, nothing else. A
 
 Inbound framing is checked here, before the SDK sees a line. The SDK's stdin reader turns an
 unparseable line into an exception that the dispatcher only logs. It also reads a request whose `id`
-is invalid (`true`, `null`, `1.5`) as a *notification*. Either way the client never gets a reply
-and waits forever. JSON-RPC 2.0 requires an answer, so `check_frame` validates the envelope of every
-raw line: malformed frames are answered with `-32700 Parse error` / `-32600 Invalid Request`, and
-only well-formed messages reach the SDK.
+is invalid (`true`, `null`, `1.5`) as a *notification*, and one carrying both `method` and `error`
+as a *response*. In each case the client never gets a reply and waits forever. JSON-RPC 2.0
+requires an answer, so `check_frame` validates every raw line: malformed frames are answered with
+`-32700 Parse error` / `-32600 Invalid Request`, and only messages the SDK's own parser accepts, as
+the kind of message they claim to be, reach the SDK.
+
+Frames are split on `\\n` only and each line is decoded as strict UTF-8 (a CRLF terminator is
+tolerated because CR is JSON whitespace). The SDK's default text layer would instead split on a bare
+CR and replace invalid UTF-8 with U+FFFD, silently altering a refund reason.
 
 Reading stdin ourselves means we also own its claim (`_claim_stdin`). As the SDK does for fd 1,
 the wire is read from a private duplicate and fd 0 points at the null device, so nothing else in
@@ -32,7 +37,6 @@ response or error goes out; at EOF the input is held open until nothing is pendi
 from __future__ import annotations
 
 import contextlib
-import io
 import json
 import logging
 import os
@@ -45,12 +49,14 @@ from typing import IO, Any, cast
 
 import anyio
 import mcp_types as types
+import pydantic_core
 from anyio.abc import ObjectSendStream
 from mcp.os.win32.utilities import rebind_std_handle_to_fd
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.shared.dispatcher import as_request_id, coerce_request_id
 from mcp.shared.message import SessionMessage
+from pydantic import ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -61,9 +67,7 @@ EOF_DRAIN_TIMEOUT = 30.0
 async def serve_stdio(server: Server[Any]) -> None:
     """Serve `server` over stdin/stdout until the client closes stdin and every request is answered."""
     with _claim_stdin() as wire_in:
-        lines = CheckedLines(
-            anyio.wrap_file(_UnownedTextWrapper(wire_in, encoding="utf-8", errors="replace"))
-        )
+        lines = CheckedLines(wire_in)
         # Order matters: the SDK must claim the *real* stdout before sys.stdout is rebound.
         # The SDK only iterates `stdin` line by line, so a checked line iterator can stand in for it.
         async with stdio_server(stdin=cast("anyio.AsyncFile[str]", lines)) as (read_stream, write_stream):
@@ -169,46 +173,94 @@ class FrameCheck:
     forward: bool
     error: types.JSONRPCError | None = None
     # The decoded frame, kept for in-flight tracking; not part of the verdict.
-    message: Mapping[str, Any] | None = field(default=None, compare=False)
+    # The SDK's own parse of a forwarded frame, kept for in-flight tracking.
+    message: types.JSONRPCMessage | None = field(default=None, compare=False)
+    # Why a frame was dropped without a reply (a malformed response from the client).
+    problem: str | None = None
 
 
-FORWARD = FrameCheck(forward=True)
 DROP = FrameCheck(forward=False)
 
+_JSON_WHITESPACE = " \t\r\n"
+_MAX_ERROR_DETAIL = 200
 
-def check_frame(line: str) -> FrameCheck:
-    """Validate one newline-delimited frame against the JSON-RPC 2.0 envelope MCP uses.
 
-    * blank line: dropped (harmless framing noise)
-    * not JSON (including the non-standard `NaN`/`Infinity` literals): `-32700 Parse error`, `id: null`
+def check_frame(line: bytes | str) -> FrameCheck:
+    """Validate one newline-delimited frame before the SDK sees it.
+
+    * blank line (JSON whitespace only): dropped (harmless framing noise)
+    * not strict UTF-8, or not JSON as the SDK's parser reads it (lone surrogate escapes, nesting
+      deeper than its recursion limit, the non-standard `NaN`/`Infinity` literals, trailing data):
+      `-32700 Parse error`, `id: null`
     * a batch array: `-32600` (MCP removed JSON-RPC batching)
     * JSON that is not a valid request or notification: `-32600 Invalid Request`, echoing the `id`
-      when it is a valid one. This covers a wrong `jsonrpc` version, a missing or non-string `method`,
-      an `id` that is not a string or integer (MCP forbids `null`), and non-object `params`.
-    * a response from the client (`result`/`error`, no `method`): forwarded. JSON-RPC never answers
-      responses, so the SDK decides what to do with it.
+      when it is a valid one. This covers a wrong `jsonrpc` version, a missing or non-string
+      `method`, `method` combined with `result`/`error`, an `id` that is not a string or integer
+      (MCP forbids `null`), non-object `params`, and anything else the SDK's message model rejects.
+    * a response from the client (`result`/`error`, no `method`): forwarded when it is a valid
+      JSON-RPC response, otherwise dropped with `problem` set. JSON-RPC never answers responses, and
+      echoing its `id` would collide with the client's own request ids.
+
+    Only frames that `types.jsonrpc_message_adapter` (the SDK's stdin parser, called the same way)
+    accepts as the kind of message they claim to be are forwarded.
     """
-    if not line.strip():
+    if isinstance(line, bytes):
+        try:
+            text = line.decode("utf-8")
+        except UnicodeDecodeError:
+            salvaged = _salvage_id(line.decode("utf-8", errors="replace"))
+            return _reject(salvaged, types.PARSE_ERROR, "Parse error", "Invalid UTF-8")
+    else:
+        text = line
+    if not text.strip(_JSON_WHITESPACE):
         return DROP
     try:
-        message = json.loads(line, parse_constant=_reject_non_standard_constant)
-    except (ValueError, RecursionError):
-        return _reject(None, types.PARSE_ERROR, "Parse error")
+        # jiter, the parser behind the SDK's adapter, but without the NaN/Infinity extension.
+        decoded = pydantic_core.from_json(text, allow_inf_nan=False)
+    except (ValueError, TypeError) as exc:  # TypeError: a str holding an unpaired surrogate
+        return _reject(_salvage_id(text), types.PARSE_ERROR, "Parse error", _json_problem(exc))
 
-    if isinstance(message, list):
+    if isinstance(decoded, list):
         return _reject(None, types.INVALID_REQUEST, "Invalid Request", "Batch requests are not supported")
-    if not isinstance(message, dict):
+    if not isinstance(decoded, dict):
         return _reject(None, types.INVALID_REQUEST, "Invalid Request", "Message must be a JSON object")
-    if "method" not in message and ("result" in message or "error" in message):
-        return FrameCheck(forward=True, message=message)
+    if "method" not in decoded and ("result" in decoded or "error" in decoded):
+        return _check_response(text, decoded)
 
-    problem = _envelope_problem(message)
+    request_id = decoded.get("id")
+    echo_id = request_id if _is_valid_id(request_id) else None
+    problem = _envelope_problem(decoded)
+    if problem is not None:
+        return _reject(echo_id, types.INVALID_REQUEST, "Invalid Request", problem)
+    try:
+        message = _sdk_parse(text)
+    except ValidationError as exc:
+        if _is_json_error(exc):
+            return _reject(echo_id, types.PARSE_ERROR, "Parse error", "Invalid JSON")
+        return _reject(echo_id, types.INVALID_REQUEST, "Invalid Request", "Not a valid JSON-RPC request")
+    expected = types.JSONRPCRequest if "id" in decoded else types.JSONRPCNotification
+    if not isinstance(message, expected):  # defensive: the envelope checks should make this unreachable
+        return _reject(echo_id, types.INVALID_REQUEST, "Invalid Request", "Not a valid JSON-RPC request")
+    return FrameCheck(forward=True, message=message)
+
+
+def _check_response(text: str, decoded: Mapping[str, Any]) -> FrameCheck:
+    problem = _response_problem(decoded)
     if problem is None:
-        return FrameCheck(forward=True, message=message)
-    request_id = message.get("id")
-    return _reject(
-        request_id if _is_valid_id(request_id) else None, types.INVALID_REQUEST, "Invalid Request", problem
-    )
+        try:
+            message = _sdk_parse(text)
+        except ValidationError:
+            problem = "not a valid JSON-RPC response"
+        else:
+            if isinstance(message, types.JSONRPCResponse | types.JSONRPCError):
+                return FrameCheck(forward=True, message=message)
+            problem = "not a valid JSON-RPC response"
+    return FrameCheck(forward=False, problem=problem)
+
+
+def _sdk_parse(text: str) -> types.JSONRPCMessage:
+    # Exactly the SDK's stdin reader call (mcp/server/stdio.py), so a forwarded line cannot fail there.
+    return types.jsonrpc_message_adapter.validate_json(text, by_name=False)
 
 
 def _envelope_problem(message: Mapping[str, Any]) -> str | None:
@@ -218,10 +270,25 @@ def _envelope_problem(message: Mapping[str, Any]) -> str | None:
         return '"method" is required'
     if not isinstance(message["method"], str):
         return '"method" must be a string'
+    if "result" in message or "error" in message:
+        return '"method" cannot be combined with "result" or "error"'
     if "id" in message and not _is_valid_id(message["id"]):
         return '"id" must be a string or an integer'
     if "params" in message and not isinstance(message["params"], dict):
         return '"params" must be an object'
+    return None
+
+
+def _response_problem(message: Mapping[str, Any]) -> str | None:
+    if message.get("jsonrpc") != "2.0":
+        return '"jsonrpc" must be exactly "2.0"'
+    if "result" in message and "error" in message:
+        return 'a response carries "result" or "error", not both'
+    if "id" not in message:
+        return '"id" is required'
+    request_id = message["id"]
+    if not (_is_valid_id(request_id) or (request_id is None and "error" in message)):
+        return '"id" must be a string or an integer'
     return None
 
 
@@ -230,8 +297,43 @@ def _is_valid_id(value: object) -> bool:
     return isinstance(value, str) or (isinstance(value, int) and not isinstance(value, bool))
 
 
-def _reject_non_standard_constant(name: str) -> None:
-    raise ValueError(f"{name} is not valid JSON")
+def _salvage_id(text: str) -> types.RequestId | None:
+    """The id of a request the SDK cannot parse, when a lenient parser can still find it.
+
+    A lone surrogate escape (which JavaScript's `JSON.stringify` emits for a split emoji), deep
+    nesting or a stray invalid byte in a string make the whole frame unusable, but the client is
+    still waiting on that request's id. JSON-RPC requires `id: null` only when the id cannot be
+    detected, so the parse error carries it whenever it can be recovered unambiguously.
+    """
+    try:
+        # strict=False also reads raw control characters inside strings.
+        decoded = json.loads(text, strict=False)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(decoded, dict) or not isinstance(decoded.get("method"), str):
+        return None  # only requests are answered
+    request_id = decoded.get("id")
+    if not _is_valid_id(request_id):
+        return None
+    if isinstance(request_id, str):
+        if "�" in request_id:
+            return None  # the id itself held invalid UTF-8: echoing a mangled id would mislead
+        try:
+            request_id.encode("utf-8")
+        except UnicodeEncodeError:
+            return None  # the id itself is an unpaired surrogate
+    return cast("types.RequestId", request_id)
+
+
+def _json_problem(exc: Exception) -> str:
+    # jiter's messages name the defect and its position, never the input itself.
+    if isinstance(exc, ValueError) and str(exc):
+        return f"Invalid JSON: {exc}"[:_MAX_ERROR_DETAIL]
+    return "Invalid JSON"
+
+
+def _is_json_error(exc: ValidationError) -> bool:
+    return any(error["type"] == "json_invalid" for error in exc.errors(include_url=False))
 
 
 def _reject(
@@ -248,12 +350,13 @@ def _reject(
 class CheckedLines:
     """Async line iterator handed to the SDK in place of stdin.
 
-    Well-formed frames are yielded to the SDK's reader; malformed ones are answered directly on the
-    outbound stream and never reach the dispatcher. At EOF the iterator ends only once every
-    forwarded request has been answered, or after `drain_timeout` seconds.
+    Reads raw bytes and splits frames on `\\n` only. Well-formed frames are yielded, decoded, to
+    the SDK's reader; malformed ones are answered directly on the outbound stream and never reach
+    the dispatcher. At EOF the iterator ends only once every forwarded request has been answered,
+    or after `drain_timeout` seconds.
     """
 
-    def __init__(self, source: anyio.AsyncFile[str], *, drain_timeout: float | None = None) -> None:
+    def __init__(self, source: IO[bytes], *, drain_timeout: float | None = None) -> None:
         self._source = source
         self._replies: ObjectSendStream[SessionMessage] | None = None
         self._bound = anyio.Event()
@@ -269,25 +372,25 @@ class CheckedLines:
 
     async def __anext__(self) -> str:
         while True:
-            line = await self._source.readline()
-            if not line:
+            # A binary readline splits on b"\n" only: a bare CR stays inside its frame.
+            raw = await anyio.to_thread.run_sync(self._source.readline)
+            if not raw:
                 await self._drain()
                 raise StopAsyncIteration
-            check = check_frame(line)
+            check = check_frame(raw)
             if check.forward:
                 self._track(check.message)
-                return line
+                return raw.decode("utf-8")  # cannot fail: check_frame decoded it strictly
             if check.error is not None:
                 await self._answer(check.error)
+            elif check.problem is not None:
+                logger.warning("dropped malformed response from the client: %s", check.problem)
 
-    def _track(self, message: Mapping[str, Any] | None) -> None:
-        if message is None or "method" not in message:
-            return  # a response from the client: nothing to answer
-        if "id" in message:
-            self.pending.add(message["id"])
-        elif message["method"] == "notifications/cancelled":
-            params = message.get("params")
-            cancelled = as_request_id(params.get("requestId")) if isinstance(params, Mapping) else None
+    def _track(self, message: types.JSONRPCMessage | None) -> None:
+        if isinstance(message, types.JSONRPCRequest):
+            self.pending.add(message.id)
+        elif isinstance(message, types.JSONRPCNotification) and message.method == "notifications/cancelled":
+            cancelled = as_request_id((message.params or {}).get("requestId"))
             if cancelled is not None:
                 self.pending.cancelled(cancelled)
 
@@ -318,14 +421,6 @@ class CheckedLines:
 # ---------------------------------------------------------------------------------------------
 # stdin claim
 # ---------------------------------------------------------------------------------------------
-class _UnownedTextWrapper(io.TextIOWrapper):
-    """Text layer that never closes the buffer under it (it may be the process's own stdin)."""
-
-    def close(self) -> None:
-        with contextlib.suppress(ValueError):
-            self.detach()
-
-
 @contextlib.contextmanager
 def _claim_stdin() -> Iterator[IO[bytes]]:
     """Read the wire from a private duplicate of fd 0 and point fd 0 at the null device.

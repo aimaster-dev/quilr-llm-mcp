@@ -65,19 +65,30 @@ submitted values, which may contain PII or be arbitrarily large.
 
 | Situation | Code | `id` in the reply |
 |-----------|------|-------------------|
-| Line is not JSON (incl. invalid UTF-8 and the non-standard `NaN` / `Infinity` literals) | `-32700` Parse error | `null` |
+| Line is not JSON as the SDK parses it: invalid UTF-8 (even inside a string), `NaN` / `Infinity`, lone surrogate escapes (`"\ud800"`), nesting deeper than ~200 levels, trailing data | `-32700` Parse error | the request's `id` if it can still be recovered, else `null` |
 | Batch array (MCP removed JSON-RPC batching) | `-32600` Invalid Request | `null` |
-| JSON but not a valid request: wrong `jsonrpc`, missing/non-string `method`, non-object `params` | `-32600` Invalid Request | echoed if valid |
+| JSON but not a valid request: wrong `jsonrpc`, missing/non-string `method`, `method` combined with `result`/`error`, non-object `params` | `-32600` Invalid Request | echoed if valid |
 | `id` that is not a string or integer (`true`, `null`, `1.5`, ...) | `-32600` Invalid Request | `null` |
 | Unknown method | `-32601` Method not found | echoed |
 | Unknown tool, malformed/missing/extra tool arguments | `-32602` Invalid params | echoed |
 | Unexpected server fault | `-32603` Internal error. The traceback goes to stderr; the wire gets no internals | echoed |
-| Blank line, client response, notification | no reply (JSON-RPC never answers these) | |
+| Blank line, notification, client response (a malformed one is logged on stderr) | no reply (JSON-RPC never answers these) | |
 
 The first four rows are handled in `stdio.py` before the SDK sees the line. The SDK's stdin reader
-only *logs* frames it cannot parse, and it reads a request with an invalid `id` as a notification. In
-both cases the client would wait forever for a reply. `check_frame` validates the JSON-RPC envelope
-of every raw line and answers malformed frames itself, so only well-formed messages reach the SDK.
+only *logs* frames it cannot parse, reads a request with an invalid `id` as a notification, and reads
+one carrying both `method` and `error` as a response. In each case the client would wait forever for
+a reply. `check_frame` answers malformed frames itself and forwards a line only once the SDK's own
+parser (`jsonrpc_message_adapter`, called exactly as the SDK calls it) accepts it as the kind of
+message it claims to be.
+
+Framing follows the MCP stdio transport: one message per line, split on `\n` only. A CRLF terminator
+is accepted (CR is JSON whitespace), but a bare CR never splits a frame. Each line is decoded as
+strict UTF-8, so invalid bytes are a parse error rather than a silent U+FFFD in a refund reason.
+
+A parse error normally carries `id: null`, because the id could not be read. JSON-RPC requires that
+only when the id cannot be detected, so when a lenient parse of the same line still finds a request
+id (a lone surrogate from a JavaScript client that split an emoji, a stray invalid byte in a string),
+the error echoes it and the client can match the error to the request it is waiting on.
 
 ## Use from an MCP host
 
