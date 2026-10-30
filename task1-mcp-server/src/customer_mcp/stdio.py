@@ -3,12 +3,15 @@
 Over stdio, stdout *is* the JSON-RPC wire: one message per line, nothing else. A single stray
 `print()` corrupts the stream and the client drops the connection. Three layers keep it clean:
 
-1. The SDK's `stdio_server()` claims fd 1. It serves the wire from a private duplicate and
-   points fd 1 at stderr, so output from C extensions, `os.write(1, ...)` and child processes
-   lands on stderr.
-2. `sys.stdout` is rebound to `sys.stderr` while serving. `print()` never touches the wire,
-   even on platforms where the fd claim falls back to sharing the original stdout buffer.
+1. `claim.claim_stdio()`, the first thing `main()` does, serves the wire from private duplicates
+   of fd 0 and fd 1 and points fd 1 at stderr (fd 0 at the null device) for the rest of the
+   process's life. Output from C extensions, `os.write(1, ...)`, child processes and `atexit`
+   hooks lands on stderr.
+2. `sys.stdout` is rebound to `sys.stderr` by the same claim, so `print()` never touches the wire.
 3. Logging is configured to stderr only (see `logging_config`).
+
+Both claimed streams are handed to the SDK's `stdio_server()` explicitly, so it claims neither
+descriptor itself and never points fd 1 back at the wire when serving ends.
 
 Inbound framing is checked here, before the SDK sees a line. The SDK's stdin reader turns an
 unparseable line into an exception that the dispatcher only logs. It also reads a request whose `id`
@@ -22,10 +25,6 @@ Frames are split on `\\n` only and each line is decoded as strict UTF-8 (a CRLF 
 tolerated because CR is JSON whitespace). The SDK's default text layer would instead split on a bare
 CR and replace invalid UTF-8 with U+FFFD, silently altering a refund reason.
 
-Reading stdin ourselves means we also own its claim (`_claim_stdin`). As the SDK does for fd 1,
-the wire is read from a private duplicate and fd 0 points at the null device, so nothing else in
-the process (or a child process) can consume bytes meant for the server.
-
 EOF on stdin does not end the session while requests are still being handled. The SDK cancels
 in-flight handlers as soon as its input ends, so a client that writes its requests and closes stdin
 (`customer-mcp < requests.jsonl`) would lose the replies to every request still running. The ids of
@@ -37,12 +36,11 @@ response or error goes out; at EOF the input is held open until nothing is pendi
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import logging
-import os
-import sys
 from collections import Counter
-from collections.abc import Iterator, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import TracebackType
 from typing import IO, Any, cast
@@ -51,12 +49,13 @@ import anyio
 import mcp_types as types
 import pydantic_core
 from anyio.abc import ObjectSendStream
-from mcp.os.win32.utilities import rebind_std_handle_to_fd
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.shared.dispatcher import as_request_id, coerce_request_id
 from mcp.shared.message import SessionMessage
 from pydantic import ValidationError
+
+from customer_mcp.claim import StdioWire, claim_stdio
 
 logger = logging.getLogger(__name__)
 
@@ -64,19 +63,34 @@ EOF_DRAIN_TIMEOUT = 30.0
 """Seconds to wait at stdin EOF for in-flight requests to be answered before shutting down."""
 
 
-async def serve_stdio(server: Server[Any]) -> None:
-    """Serve `server` over stdin/stdout until the client closes stdin and every request is answered."""
-    with _claim_stdin() as wire_in:
-        lines = CheckedLines(wire_in)
-        # Order matters: the SDK must claim the *real* stdout before sys.stdout is rebound.
-        # The SDK only iterates `stdin` line by line, so a checked line iterator can stand in for it.
-        async with stdio_server(stdin=cast("anyio.AsyncFile[str]", lines)) as (read_stream, write_stream):
+async def serve_stdio(server: Server[Any], wire: StdioWire | None = None) -> None:
+    """Serve `server` over the claimed wire until stdin closes and every request is answered.
+
+    `wire` is normally claimed by `main()` before anything else runs; it is claimed here otherwise.
+    """
+    wire = wire or claim_stdio()
+    lines = CheckedLines(wire.reader)
+    # newline="\n": no CRLF translation on Windows, every frame ends in exactly one LF.
+    stdout = anyio.wrap_file(io.TextIOWrapper(wire.writer, encoding="utf-8", newline="\n"))
+    try:
+        # Both streams are explicit, so the SDK claims neither descriptor and, in particular, never
+        # points fd 1 back at the wire when it exits. It only iterates `stdin` line by line, so a
+        # checked line iterator can stand in for a file.
+        async with stdio_server(stdin=cast("anyio.AsyncFile[str]", lines), stdout=stdout) as (
+            read_stream,
+            write_stream,
+        ):
             lines.bind_replies(write_stream)
             # The server's replies pass through a stream that marks each answered request id. The
             # frame layer keeps the raw stream: its own replies answer nothing that was forwarded.
             outbound = AnsweringStream(write_stream, lines.pending)
-            with contextlib.redirect_stdout(sys.stderr):
-                await server.run(read_stream, outbound, server.create_initialization_options())
+            await server.run(read_stream, outbound, server.create_initialization_options())
+    finally:
+        lines.close()
+        # The client sees EOF on stdout now rather than at process exit. Shielded: this also runs
+        # when serving was cancelled, and the close must not be cut short.
+        with anyio.CancelScope(shield=True), contextlib.suppress(OSError, ValueError):
+            await stdout.aclose()
 
 
 # ---------------------------------------------------------------------------------------------
@@ -361,19 +375,29 @@ class CheckedLines:
         self._replies: ObjectSendStream[SessionMessage] | None = None
         self._bound = anyio.Event()
         self._drain_timeout = EOF_DRAIN_TIMEOUT if drain_timeout is None else drain_timeout
+        self._reading = False
         self.pending = PendingRequests()
 
     def bind_replies(self, replies: ObjectSendStream[SessionMessage]) -> None:
         self._replies = replies
         self._bound.set()
 
+    def close(self) -> None:
+        """Release the input stream, unless a worker thread may still be blocked reading it.
+
+        A descriptor closed under a blocked reader could be recycled for an unrelated file, so it
+        is then left to the process exit instead.
+        """
+        if not self._reading:
+            with contextlib.suppress(OSError):
+                self._source.close()
+
     def __aiter__(self) -> CheckedLines:
         return self
 
     async def __anext__(self) -> str:
         while True:
-            # A binary readline splits on b"\n" only: a bare CR stays inside its frame.
-            raw = await anyio.to_thread.run_sync(self._source.readline)
+            raw = await self._readline()
             if not raw:
                 await self._drain()
                 raise StopAsyncIteration
@@ -385,6 +409,13 @@ class CheckedLines:
                 await self._answer(check.error)
             elif check.problem is not None:
                 logger.warning("dropped malformed response from the client: %s", check.problem)
+
+    async def _readline(self) -> bytes:
+        # A binary readline splits on b"\n" only: a bare CR stays inside its frame.
+        self._reading = True
+        raw = await anyio.to_thread.run_sync(self._source.readline)
+        self._reading = False  # not reached if the read raised: the stream is then left open
+        return raw
 
     def _track(self, message: types.JSONRPCMessage | None) -> None:
         if isinstance(message, types.JSONRPCRequest):
@@ -416,62 +447,3 @@ class CheckedLines:
         assert self._replies is not None
         with contextlib.suppress(anyio.BrokenResourceError, anyio.ClosedResourceError):
             await self._replies.send(SessionMessage(reply))
-
-
-# ---------------------------------------------------------------------------------------------
-# stdin claim
-# ---------------------------------------------------------------------------------------------
-@contextlib.contextmanager
-def _claim_stdin() -> Iterator[IO[bytes]]:
-    """Read the wire from a private duplicate of fd 0 and point fd 0 at the null device.
-
-    Best effort, like the SDK's claim of fd 1: when stdin is not fd 0 (an embedded or test run) or
-    the descriptors cannot be moved, the stream is read in place.
-    """
-    try:
-        buffer: IO[bytes] = sys.stdin.buffer
-        backed_by_fd0 = buffer.fileno() == 0
-    except (AttributeError, OSError, ValueError):
-        backed_by_fd0 = False
-    if not backed_by_fd0:
-        yield sys.stdin.buffer
-        return
-
-    try:
-        private_fd = os.dup(0)
-    except OSError:
-        yield buffer
-        return
-    if private_fd <= 2:  # a standard fd was closed; never serve the wire from one
-        os.close(private_fd)
-        yield buffer
-        return
-
-    diverted = _point_fd_at(0, os.devnull)
-    try:
-        # closefd=False: after an interrupted shutdown a worker thread can still be blocked reading
-        # this descriptor, so it is never closed (and so never recycled under that thread).
-        yield os.fdopen(private_fd, "rb", closefd=False)
-    finally:
-        if diverted:
-            with contextlib.suppress(OSError):
-                os.dup2(private_fd, 0)
-                rebind_std_handle_to_fd(0)
-
-
-def _point_fd_at(fd: int, path: str) -> bool:
-    try:
-        target = os.open(path, os.O_RDONLY)
-    except OSError:
-        return False
-    try:
-        os.dup2(target, fd)
-    except OSError:
-        return False
-    finally:
-        os.close(target)
-    # os.dup2 only updates the C runtime table. On Windows, child processes inherit the Win32
-    # standard-handle slot, so point that at the null device as well.
-    with contextlib.suppress(OSError):
-        rebind_std_handle_to_fd(fd)
-    return True

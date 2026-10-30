@@ -102,21 +102,40 @@ the error echoes it and the client can match the error to the request it is wait
 
 ## stdout isolation
 
-stdout is the wire, so the server protects it in three layers:
+stdout is the wire, so the server claims it for the whole life of the process, as the very first
+thing `main()` does, before logging is configured or the server is built (`claim.py`):
 
-1. The SDK's `stdio_server()` serves the wire from a private duplicate of fd 1 and points fd 1 at
-   stderr. Output from C extensions, `os.write(1, …)` and child processes cannot reach the client.
-2. `sys.stdout` is rebound to `sys.stderr` while serving, so a stray `print()` cannot reach the
-   wire either.
+1. The wire is served from a private, non-inheritable duplicate of fd 1, and fd 1 is pointed at
+   stderr (the Win32 standard handle too, which is what child processes inherit on Windows).
+   Output from C extensions, `os.write(1, …)`, child processes and `atexit` hooks lands on stderr.
+2. `sys.stdout` is rebound to `sys.stderr`, so a stray `print()` cannot reach the wire. Anything
+   still buffered in the original `sys.stdout` is flushed *after* fd 1 was diverted, so it lands on
+   stderr too, and so does anything written later to `sys.__stdout__` or through a library
+   `StreamHandler` that captured the original stdout object.
 3. `logging` is configured with a single stderr handler.
+
+fd 1 is never pointed back at the wire, not even at exit. The SDK's own `stdio_server()` restores it
+when serving ends, after which a buffered startup `print()` or a `sys.__stdout__` write was flushed
+onto the wire behind the last reply. The claimed streams are passed to `stdio_server()` explicitly,
+so it claims (and restores) nothing. Replies end in a single `\n` on every platform (no CRLF
+translation on Windows).
 
 stdin gets the same treatment: the server reads the wire from a private duplicate of fd 0 and points
 fd 0 at the null device. A library or child process that reads stdin gets EOF and cannot consume
-bytes meant for the server.
+bytes meant for the server. With stdin closed altogether the server logs a warning and exits; with
+stdout closed it refuses to start (exit code 1).
 
-The test suite checks all of this at the byte level. Every line the server writes to stdout must
-parse as a JSON-RPC 2.0 message, including when a tool handler `print()`s, writes to fd 1 directly
-and spawns a child process that writes to stdout and reads stdin (`tests/noisy_server.py`).
+The entry point imports only the standard library before claiming the wire; the SDK, pydantic and
+the server are imported afterwards, so their import-time output is diverted too. What no server can
+take back is output written to the pipe before `main()` runs at all, for example by a wrapper
+script that prints with `PYTHONUNBUFFERED` set, or a logging handler that flushes, before calling
+`main()`. Output still sitting in Python's stdout buffer at that point is diverted.
+
+The test suite checks all of this at the byte level, launching the server the way hosts do (stdout
+fully buffered; `PYTHONUNBUFFERED` is removed unless a test asks for it). Every line the server
+writes to stdout must parse as a JSON-RPC 2.0 message ending in `\n`, while `tests/noisy_server.py`
+writes to stdout before `main()`, during startup, while serving (`print()`, fd 1, `sys.__stdout__`,
+a library handler, a child process that also reads stdin) and from an `atexit` hook.
 
 ## Tests
 
@@ -130,5 +149,5 @@ pytest
 | `test_tools.py` | Tool behaviour through the SDK client (in-process), incl. concurrent refunds |
 | `test_frames.py` | Envelope validation of raw stdin lines |
 | `test_protocol_errors.py` | Every JSON-RPC error code, asserted on the real binary's stdout |
-| `test_stdio_transport.py` | Handshake, stderr-only logging, stray-output isolation, official SDK client over stdio |
+| `test_stdio_transport.py` | Handshake, stderr-only logging, stray-output isolation (startup, serving, exit; buffered and unbuffered), closed stdin/stdout, official SDK client over stdio |
 | `test_shutdown.py` | Every request read before stdin EOF is answered (10 parallel replays), cancelled and stuck requests |

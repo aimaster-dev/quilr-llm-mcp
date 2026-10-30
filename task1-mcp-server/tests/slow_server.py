@@ -25,4 +25,4 @@ if __name__ == "__main__":
     CustomerStore.create_refund = _stuck_refund  # type: ignore[method-assign]
     if len(sys.argv) > 1:
         stdio.EOF_DRAIN_TIMEOUT = float(sys.argv.pop(1))
-    main()
+    sys.exit(main())
