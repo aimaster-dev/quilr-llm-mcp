@@ -49,9 +49,15 @@ class GatewayError(Exception):
     type: str = "upstream_error"
     headers: dict[str, str] = field(default_factory=dict)
     upstream_code: str | None = None
+    param: str | None = None
 
     def payload(self) -> dict[str, Any]:
-        error: dict[str, Any] = {"message": self.message, "type": self.type, "code": self.code}
+        error: dict[str, Any] = {
+            "message": self.message,
+            "type": self.type,
+            "param": self.param,
+            "code": self.code,
+        }
         if self.upstream_code:
             error["upstream_code"] = self.upstream_code
         return {"error": error}
@@ -169,7 +175,7 @@ class Gateway:
         started = time.perf_counter()
         try:
             raw = await self._read_request(request)
-            stream = self._wants_stream(raw)
+            stream = self._check_request(raw)
             upstream = await self._send(request, raw, stream)
             content_type = upstream.headers.get("content-type", "")
             if stream and content_type.startswith("text/event-stream"):
@@ -196,7 +202,8 @@ class Gateway:
             raise too_large from None
 
     @staticmethod
-    def _wants_stream(raw: bytes) -> bool:
+    def _check_request(raw: bytes) -> bool:
+        """Refuse what the gateway cannot redact; return whether the client asked for a stream."""
         try:
             body = json.loads(raw)
         except ValueError:
@@ -206,6 +213,26 @@ class Gateway:
         if not isinstance(body, dict):
             raise GatewayError(
                 400, "invalid_request", "Request body must be a JSON object.", "invalid_request_error"
+            )
+        # Fail closed on output that bypasses text redaction: logprobs repeat every generated
+        # token (with its bytes and alternatives), and audio speaks the answer.
+        for name in ("logprobs", "top_logprobs"):
+            if body.get(name):
+                raise GatewayError(
+                    400,
+                    "logprobs_not_supported",
+                    "logprobs and top_logprobs are not supported: token-level output cannot be redacted.",
+                    "invalid_request_error",
+                    param=name,
+                )
+        modalities = body.get("modalities")
+        if body.get("audio") or (isinstance(modalities, list) and "audio" in modalities):
+            raise GatewayError(
+                400,
+                "audio_not_supported",
+                "Audio output is not supported: spoken output cannot be redacted.",
+                "invalid_request_error",
+                param="modalities",
             )
         return body.get("stream") is True
 

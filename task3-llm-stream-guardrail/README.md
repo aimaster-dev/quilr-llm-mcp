@@ -68,19 +68,30 @@ upstream bytes ─▶ SSEParser ─▶ ChatStreamRedactor ─▶ SSE bytes ─�
 - **Incremental SSE parsing.** Upstream bytes can split anywhere: inside a multi-byte UTF-8
   character (incremental decoder), between `\r` and `\n`, or mid-field. The parser keeps one
   partial line and yields each event as soon as its blank line arrives.
-- **One redactor per text stream.** Redactors are keyed by `choices[i].index` for `content` and
-  `refusal`, and by `(choice, tool_call.index)` for `tool_calls[].function.arguments`, so `n > 1`
-  and parallel tool calls never share state.
+- **Deny by default.** Every string under a choice's `delta` (or `message`) is treated as model
+  output and redacted, whatever the field: `content` (a string or an array of content parts),
+  `refusal`, `reasoning_content`, `reasoning`, `audio.transcript`, tool-call and legacy
+  `function_call` arguments, and fields the gateway has never heard of. Only structural values are
+  exempt: `role`, `type`, `id`, `index` and a tool's `function.name`. Other choice fields (say a
+  legacy `text`) are redacted one shot.
+- **Token logprobs are refused.** `logprobs` repeats every generated token with its bytes, which
+  cannot be redacted token by token. Requests with `logprobs` or `top_logprobs` get a 400, and a
+  `logprobs` object the upstream sends anyway is replaced by `null`. Audio output (`modalities`
+  with `audio`, or an `audio` parameter) is refused for the same reason: speech cannot be redacted.
+- **One redactor per text stream.** Each field is its own stream, keyed by `(choices[i].index,
+  field path)`. Tool calls are identified by their `index` field and content parts by their
+  `type`, not by array position, so `n > 1` and parallel tool calls never share state. A text
+  content part continues the `content` string, as clients read both as the message text.
 - **Flush points.** When a choice's `finish_reason` chunk arrives, the text that choice still holds
-  goes out in a synthetic chunk **just before** it (same `id`/`model`/`created`), and the finish
-  chunk keeps an empty delta. The same happens before `data: [DONE]` and at EOF, so clients that
-  stop reading at either point miss nothing.
+  in any field goes out in a synthetic chunk **just before** it (same `id`/`model`/`created`), and
+  the finish chunk keeps an empty delta. The same happens before `data: [DONE]` and at EOF, so
+  clients that stop reading at either point miss nothing.
 - **No extra latency.** Each event is written to the client as soon as it is redacted, even when
   one upstream read carried many. Chunks whose text is entirely held back, and that carry nothing
-  else (no role, `finish_reason`, `usage` or logprobs), are dropped instead of being sent empty.
-  Comments (`: keep-alive`) and other non-content events pass through.
-- **Non-streaming** (`"stream": false`): `choices[].message.content`, `refusal` and tool-call
-  arguments are redacted in the JSON response.
+  else (no role, id, `finish_reason`, `usage` or other choice data), are dropped instead of being
+  sent empty. Comments (`: keep-alive`) and other non-content events pass through.
+- **Non-streaming** (`"stream": false`): the same deny-by-default rules apply to
+  `choices[].message`, one shot.
 - **Payloads it does not recognise** (a mid-stream `{"error": …}`, non-JSON `data:`) are redacted
   as plain text rather than passed through.
 - **Client disconnect cancels the upstream request** immediately, even while the model is silent.
@@ -94,11 +105,13 @@ upstream bytes ─▶ SSEParser ─▶ ChatStreamRedactor ─▶ SSE bytes ─�
 ### Errors
 
 Upstream bodies, exception text and internal addresses never reach the client. Errors use
-OpenAI's shape: `{"error": {"message", "type", "code"}}`.
+OpenAI's shape: `{"error": {"message", "type", "param", "code"}}`.
 
 | Situation | Client gets |
 |-----------|-------------|
 | Body is not JSON, or not an object / too large | 400 `invalid_json` / `invalid_request`, 413 `request_too_large` (upstream not called) |
+| `logprobs` / `top_logprobs` requested | 400 `logprobs_not_supported`, `param` names the field (upstream not called) |
+| Audio output requested (`modalities`, `audio`) | 400 `audio_not_supported` (upstream not called) |
 | Upstream 400/404/409/413/415/422 | Same status, `upstream_rejected_request`, plus `upstream_code` if the provider sent a safe machine-readable code such as `model_not_found` |
 | Upstream 401/403 (the gateway's key) | 502 `upstream_auth_failed` |
 | Upstream 429 | 429 `rate_limited`, `Retry-After` passed through if it is a plain token |
@@ -202,7 +215,7 @@ word, a partial email, or a partial digit group.
 |------|----------------|
 | Engine (`test_redaction*.py`) | Detector semantics; **streaming == one-shot for any chunking** (Hypothesis + exhaustive 2/3-way splits); buffer ≤ `MAX_BUFFERED` after every chunk; nothing held across `\n`; long runs released |
 | SSE (`test_sse.py`) | Same events for every byte split point, byte-by-byte and random splits (UTF-8, `\r\n`, `\r`) |
-| Chunk transformer (`test_completions.py`) | Per-choice isolation for `n=2`, tool-call arguments, flush-before-`finish_reason` ordering, `[DONE]`/EOF flush, dropped empty chunks |
+| Chunk transformer (`test_completions.py`) | Every delta and message field redacted (content parts, reasoning, audio transcript, tool and legacy function arguments, unknown fields), structural values intact, logprobs dropped, tool calls keyed by `index`; Hypothesis: any interleaving of fields and choices reads as one-shot redaction, with nothing after `finish_reason`; `[DONE]`/EOF flush, dropped empty chunks |
 | Gateway (`test_gateway.py`) | Redacted SSE, credential handling, sanitized error mapping, mid-stream failure, **disconnect cancels upstream** |
 | Latency and memory (`test_streaming_latency.py`) | **First safe delta reaches the client while the upstream is blocked** waiting for it (a buffering gateway deadlocks); held text waits for one delta only; redactor peak < 64 chars over 5,000+ deltas; traced memory ~100 KB for a 1 MB stream |
 | Real sockets (`test_end_to_end.py`) | Same guarantees over uvicorn + loopback TCP, including disconnect cancellation |
@@ -265,7 +278,12 @@ What this shows:
 - **Tool-call arguments are redacted as text.** `{"email": "a@b.co"}` stays valid JSON, but a card
   number written as a bare JSON number becomes `[REDACTED]` and makes the arguments invalid JSON.
   This is deliberate: breaking the call beats leaking the number. JSON-escaped PII
-  (`a@b.co`) is not decoded first. The legacy `function_call` field is not covered.
+  (`a@b.co`) is not decoded first.
+- **Unknown fields are treated as text streams.** A string field the gateway does not know (an
+  annotation URL, say) may have its last word held back and delivered in a later chunk, which is
+  harmless for clients that concatenate deltas. Text split across two *different* fields is not
+  joined. Redaction also shifts character offsets, so `annotations[].start_index`/`end_index`
+  can point at the wrong text.
 - **Obfuscated PII** (`john at example dot com`, digits spelled out, homoglyphs, full-width digits)
   is not detected. Only ASCII digits count for cards and SSNs.
 - **Bare 9-digit SSNs** (`123456789`) are not redacted. Without separators they cannot be told

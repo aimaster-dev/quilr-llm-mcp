@@ -222,6 +222,140 @@ async def test_bad_requests_never_reach_upstream(
     assert upstream.requests == []
 
 
+@pytest.mark.parametrize(
+    ("extra", "code", "param"),
+    [
+        ({"logprobs": True}, "logprobs_not_supported", "logprobs"),
+        ({"logprobs": True, "top_logprobs": 0}, "logprobs_not_supported", "logprobs"),
+        ({"top_logprobs": 2}, "logprobs_not_supported", "top_logprobs"),
+        ({"logprobs": 1}, "logprobs_not_supported", "logprobs"),  # truthy is enough: fail closed
+        ({"modalities": ["text", "audio"], "audio": {"voice": "alloy"}}, "audio_not_supported", "modalities"),
+        ({"audio": {"voice": "alloy", "format": "wav"}}, "audio_not_supported", "modalities"),
+    ],
+)
+async def test_output_that_cannot_be_redacted_is_refused(
+    make_gateway: MakeGateway, extra: dict[str, object], code: str, param: str
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("upstream must not be called")
+
+    app, upstream = make_gateway(handler)
+    for request_body in (STREAM_REQUEST, PLAIN_REQUEST):
+        async with asgi_request(app, PATH, {**request_body, **extra}) as response:
+            error = (await response.json())["error"]
+        assert response.status == 400
+        assert error["type"] == "invalid_request_error"
+        assert error["code"] == code
+        assert error["param"] == param
+    assert upstream.requests == []
+
+
+async def test_logprobs_disabled_explicitly_is_accepted(make_gateway: MakeGateway) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return sse_response([content_stream("ok")])
+
+    app, upstream = make_gateway(handler)
+    request_body = {**STREAM_REQUEST, "logprobs": False, "top_logprobs": 0, "modalities": ["text"]}
+    async with asgi_request(app, PATH, request_body) as response:
+        await response.read()
+    assert response.status == 200
+    assert len(upstream.requests) == 1
+
+
+def logprobs_for(text: str) -> dict[str, object]:
+    token = {"token": text, "logprob": -0.1, "bytes": list(text.encode())}
+    return {"content": [{**token, "top_logprobs": [token]}]}
+
+
+async def test_logprobs_sent_anyway_are_dropped(make_gateway: MakeGateway) -> None:
+    # A provider that ignores the missing flag (or a misconfigured one) still cannot leak tokens.
+    pieces = ["Mail ", "john", "@example", ".com", " now"]
+    chunks = [completion_chunk(content=p) for p in pieces]
+    for c, piece in zip(chunks, pieces, strict=True):
+        c["choices"][0]["logprobs"] = logprobs_for(piece)
+    completion = {
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "".join(pieces)},
+                "logprobs": logprobs_for("john@example.com"),
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if json.loads(request.content).get("stream"):
+            return sse_response([sse(*chunks, completion_chunk(finish="stop"), "[DONE]")])
+        return httpx.Response(200, json=completion)
+
+    app, _ = make_gateway(handler)
+    async with asgi_request(app, PATH, STREAM_REQUEST) as response:
+        streamed = await response.read()
+    async with asgi_request(app, PATH, PLAIN_REQUEST) as response:
+        plain = await response.read()
+    assert content_of(events_of(streamed)) == f"Mail {R} now"
+    assert json.loads(plain)["choices"][0] == {
+        "index": 0,
+        "message": {"role": "assistant", "content": f"Mail {R} now"},
+        "logprobs": None,
+        "finish_reason": "stop",
+    }
+    for body in (streamed, plain):
+        assert b"john" not in body
+        assert b"106, 111, 104, 110" not in body  # the token's UTF-8 bytes, "john"
+
+
+async def test_reasoning_audio_and_content_parts_are_redacted(make_gateway: MakeGateway) -> None:
+    secrets = [b"john@example.com", b"123-45-6789", b"4111 1111 1111 1111"]
+    stream = sse(
+        completion_chunk(role="assistant", content=""),
+        completion_chunk(reasoning_content="The user's email is john@exa"),
+        completion_chunk(reasoning_content="mple.com, SSN 123-45-6789."),
+        completion_chunk(reasoning="Card 4111 1111 1111 1111"),
+        completion_chunk(audio={"id": "audio_1", "transcript": "write to john@example.com"}),
+        completion_chunk(content=[{"type": "text", "text": "john@example.com"}]),
+        completion_chunk(finish="stop"),
+        "[DONE]",
+    )
+    message = {
+        "role": "assistant",
+        "content": [{"type": "text", "text": "Card 4111 1111 1111 1111"}],
+        "reasoning_content": "email john@example.com",
+        "reasoning": "SSN 123-45-6789",
+        "audio": {"id": "audio_1", "data": "UklGRg==", "transcript": "john@example.com"},
+    }
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if json.loads(request.content).get("stream"):
+            return sse_response(split_every(stream, 5))
+        return httpx.Response(200, json={"choices": [{"index": 0, "message": message}]})
+
+    app, _ = make_gateway(handler)
+    async with asgi_request(app, PATH, STREAM_REQUEST) as response:
+        streamed = await response.read()
+    async with asgi_request(app, PATH, PLAIN_REQUEST) as response:
+        plain = await response.json()
+    for secret in secrets:
+        assert secret not in streamed
+    reasoning = "".join(
+        choice["delta"].get("reasoning_content") or ""
+        for event in events_of(streamed)
+        if event.data and event.data != "[DONE]"
+        for choice in json.loads(event.data)["choices"]
+    )
+    assert reasoning == f"The user's email is {R}, SSN {R}."
+    assert plain["choices"][0]["message"] == {
+        "role": "assistant",
+        "content": [{"type": "text", "text": f"Card {R}"}],
+        "reasoning_content": f"email {R}",
+        "reasoning": f"SSN {R}",
+        "audio": {"id": "audio_1", "data": "UklGRg==", "transcript": R},
+    }
+
+
 async def test_mid_stream_failure_flushes_then_reports_in_band(make_gateway: MakeGateway) -> None:
     async def body() -> AsyncIterator[bytes]:
         yield sse(completion_chunk(content="Contact ann@corp.io"))
