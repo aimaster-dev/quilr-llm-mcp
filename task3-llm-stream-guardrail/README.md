@@ -67,26 +67,60 @@ upstream bytes ─▶ SSEParser ─▶ ChatStreamRedactor ─▶ SSE bytes ─�
 
 - **Incremental SSE parsing.** Upstream bytes can split anywhere: inside a multi-byte UTF-8
   character (incremental decoder), between `\r` and `\n`, or mid-field. The parser keeps one
-  partial line and yields each event as soon as its blank line arrives.
-- **One redactor per text stream.** Redactors are keyed by `choices[i].index` for `content` and
-  `refusal`, and by `(choice, tool_call.index)` for `tool_calls[].function.arguments`, so `n > 1`
-  and parallel tool calls never share state.
+  partial line and yields each event as soon as its blank line arrives. Only new text is scanned
+  for line endings and a line spanning reads is joined once, so a long line in small reads costs
+  linear time (900 KB in 256-byte reads: 6 ms, was 9.7 s). One leading byte order mark is
+  stripped, as WHATWG requires. When an event exceeds `MAX_EVENT_SIZE`, the events completed
+  before it in the same read are still delivered, then the stream ends with
+  `upstream_invalid_stream`.
+- **Deny by default.** Every string under a choice's `delta` (or `message`) is treated as model
+  output and redacted, whatever the field: `content` (a string or an array of content parts),
+  `refusal`, `reasoning_content`, `reasoning`, `audio.transcript`, tool-call and legacy
+  `function_call` arguments, and fields the gateway has never heard of. Only structural values are
+  exempt: `role`, `type`, `id`, `index` and a tool's `function.name`. Other choice fields (say a
+  legacy `text`) are redacted one shot.
+- **Token logprobs are refused.** `logprobs` repeats every generated token with its bytes, which
+  cannot be redacted token by token. Requests with `logprobs` or `top_logprobs` get a 400, and a
+  `logprobs` object the upstream sends anyway is replaced by `null`. Audio output (`modalities`
+  with `audio`, or an `audio` parameter) is refused for the same reason: speech cannot be redacted.
+- **One redactor per text stream.** Each field is its own stream, keyed by `(choices[i].index,
+  field path)`. Tool calls are identified by their `index` field and content parts by their
+  `type`, not by array position, so `n > 1` and parallel tool calls never share state. A text
+  content part continues the `content` string, as clients read both as the message text.
 - **Flush points.** When a choice's `finish_reason` chunk arrives, the text that choice still holds
-  goes out in a synthetic chunk **just before** it (same `id`/`model`/`created`), and the finish
-  chunk keeps an empty delta. The same happens before `data: [DONE]` and at EOF, so clients that
-  stop reading at either point miss nothing.
-- **No extra latency.** Each event is written to the client as soon as it is redacted, even when
-  one upstream read carried many. Chunks whose text is entirely held back, and that carry nothing
-  else (no role, `finish_reason`, `usage` or logprobs), are dropped instead of being sent empty.
-  Comments (`: keep-alive`) and other non-content events pass through.
-- **Non-streaming** (`"stream": false`): `choices[].message.content`, `refusal` and tool-call
-  arguments are redacted in the JSON response.
-- **Payloads it does not recognise** (a mid-stream `{"error": …}`, non-JSON `data:`) are redacted
-  as plain text rather than passed through.
-- **Client disconnect cancels the upstream request** immediately, even while the model is silent.
-  Starlette's `StreamingResponse` only watches for disconnects on ASGI spec < 2.4 servers.
-  `EventStreamResponse` always watches `receive()`, and the relay closes the upstream response in
-  a shielded `finally`.
+  in any field goes out in a synthetic chunk **just before** it (same `id`/`model`/`created`), and
+  the finish chunk keeps an empty delta. The same happens before `data: [DONE]` and at EOF, so
+  clients that stop reading at either point miss nothing.
+- **Latency: the trailing word waits for the next delta.** Each event is written to the client as
+  soon as it is redacted, even when one upstream read carried many, but the end of each delta that
+  could still grow into a match is held until more text arrives: the last word (`today` could
+  become `today@example.com`), a partial number or a partial address. With token-sized deltas
+  that is most of them: on LLM-like prose split into BPE-style tokens (a word with its leading
+  space per delta), only 12% of deltas are forwarded whole on arrival and 80% of characters leave
+  one delta later. A run of address characters spread over several tokens waits longer, up to 5
+  deltas for `version 2.3.1`. At 20 ms per token that is 20 ms for most words. Nothing waits
+  beyond the next character that cannot be part of a match (a space after a word, punctuation, a
+  newline), and CJK text is never held. Chunks whose text is entirely held back, and that carry
+  nothing else (no role, id, `finish_reason`, `usage` or other choice data), are dropped instead of
+  being sent empty. Comments (`: keep-alive`) and other non-content events pass through.
+- **Non-streaming** (`"stream": false`): the same deny-by-default rules apply to
+  `choices[].message`, one shot. A JSON answer to a streaming request is handled the same way.
+- **Payloads it does not recognise** (a mid-stream `{"error": …}`, non-JSON `data:`, a provider
+  whose events have no `choices`, such as TGI's `{"token": {"text": …}}`) are redacted as plain
+  text rather than passed through. Such events are redacted **one at a time**: the gateway does
+  not know which of their fields continue across events, so a pattern split between two of them
+  (`"mail john@exa"`, `"mple.com"`) is not caught. Only the OpenAI `choices` shape is streamed
+  with hold-back.
+- **Client disconnect cancels the upstream request** immediately, in every phase: while the
+  provider is still thinking (no status line sent yet), while a non-streaming answer is being
+  read, and while a stream is relayed. The endpoint is a plain ASGI app: once the request body is
+  read, one task watches `receive()` for `http.disconnect` for the rest of the request and cancels
+  the work, and the upstream response is closed in a shielded `finally`. (Starlette's
+  `StreamingResponse` only watches while streaming, and only on ASGI spec < 2.4 servers.)
+- **Nothing unexpected reaches the client.** JSON goes out with ASCII escapes, so a lone surrogate
+  from the provider (`"\ud83d"`) cannot break the encoding. A bug while relaying a stream ends it
+  with held text flushed and an in-band `internal_error` event, not a broken chunked body; anything
+  else becomes a 500 in the OpenAI error shape, with details only in the log.
 - **Credentials.** The client's `Authorization` and cookies are never forwarded. Only the
   gateway's own key, `x-request-id` (if it is a safe token) and `accept-encoding: identity` go
   upstream. `identity` matters because compression would make the provider buffer tokens.
@@ -94,17 +128,36 @@ upstream bytes ─▶ SSEParser ─▶ ChatStreamRedactor ─▶ SSE bytes ─�
 ### Errors
 
 Upstream bodies, exception text and internal addresses never reach the client. Errors use
-OpenAI's shape: `{"error": {"message", "type", "code"}}`.
+OpenAI's shape: `{"error": {"message", "type", "param", "code"}}`, with a fixed message per code.
 
-| Situation | Client gets |
-|-----------|-------------|
-| Body is not JSON, or not an object / too large | 400 `invalid_json` / `invalid_request`, 413 `request_too_large` (upstream not called) |
-| Upstream 400/404/409/413/415/422 | Same status, `upstream_rejected_request`, plus `upstream_code` if the provider sent a safe machine-readable code such as `model_not_found` |
-| Upstream 401/403 (the gateway's key) | 502 `upstream_auth_failed` |
-| Upstream 429 | 429 `rate_limited`, `Retry-After` passed through if it is a plain token |
-| Upstream 408/504, connect/read timeout | 504 `upstream_timeout` |
-| Upstream 5xx, connection refused | 502 `upstream_error` / `upstream_unavailable` |
-| Failure **after** streaming started | Held text is flushed (redacted), then `data: {"error": {…"code":"upstream_stream_error"}}`; no `[DONE]` |
+**Before the response starts** the client gets an HTTP error:
+
+| Situation | Status | `code` | `type` |
+|-----------|-------:|--------|--------|
+| Body is not JSON, or nested too deeply to parse (upstream not called) | 400 | `invalid_json` | `invalid_request_error` |
+| Body is not a JSON object (upstream not called) | 400 | `invalid_request` | `invalid_request_error` |
+| Body larger than `MAX_REQUEST_BYTES` (upstream not called) | 413 | `request_too_large` | `invalid_request_error` |
+| `logprobs` / `top_logprobs` requested; `param` names the field (upstream not called) | 400 | `logprobs_not_supported` | `invalid_request_error` |
+| Audio output requested: `modalities` with `audio`, or `audio` (upstream not called) | 400 | `audio_not_supported` | `invalid_request_error` |
+| Upstream 400/404/409/413/415/422; `upstream_code` added if the provider sent a safe machine-readable code such as `model_not_found` | same | `upstream_rejected_request` | `invalid_request_error` |
+| Upstream 401/403: the gateway's own key was rejected | 502 | `upstream_auth_failed` | `upstream_error` |
+| Upstream 429; `Retry-After` passed through if it is a plain token | 429 | `rate_limited` | `rate_limit_error` |
+| Upstream 408/504, connect or read timeout before the answer | 504 | `upstream_timeout` | `upstream_error` |
+| Connection refused, DNS failure, other transport error | 502 | `upstream_unavailable` | `upstream_error` |
+| Upstream 5xx, 3xx (redirects are never followed; no `Location`, no body) or any other non-2xx | 502 | `upstream_error` | `upstream_error` |
+| Upstream 2xx whose complete answer is not JSON (HTML, empty 204, nested too deeply) | 502 | `upstream_invalid_response` | `upstream_error` |
+| Complete answer larger than `MAX_RESPONSE_BYTES` | 502 | `upstream_response_too_large` | `upstream_error` |
+| Unexpected gateway error (a bug), also via the app-level handler | 500 | `internal_error` | `server_error` |
+
+**After streaming started** the status line (200) is already out. Held text is flushed (redacted
+as end-of-text), then one `data: {"error": {…}}` event ends the stream, without `[DONE]`:
+
+| Situation | `code` in the error event |
+|-----------|---------------------------|
+| No upstream read for `READ_TIMEOUT` seconds | `upstream_timeout` |
+| Upstream connection dropped or reset | `upstream_stream_error` |
+| An event larger than `MAX_EVENT_SIZE` (events completed before it are delivered first) | `upstream_invalid_stream` |
+| Unexpected gateway error while relaying (held text is flushed only if the redactor can) | `internal_error` |
 
 ## Redaction engine
 
@@ -122,9 +175,14 @@ redact("SSN 123-45-6789")  # "SSN [REDACTED]"
 
 | Type | Rule | False-positive control |
 |------|------|------------------------|
-| Email | `local@label.label…`: local part ≤ 64 chars of `[\w.%+-]`, 2–8 labels of ≤ 63 chars of `[\w-]`, Unicode letters allowed | Last label must be a TLD (≥ 2 letters, or `xn--` punycode); invalid trailing labels are trimmed (`john@example.com.123` keeps `.123`) |
-| Payment card | 13–19 digits, a single space or dash allowed between any two digits (`4111 1111 1111 1111`, `3782-822463-10005`) | **Luhn checksum**; not glued to other digits; must end on a digit-group boundary |
-| US SSN | `AAA-GG-SSSS` or `AAA GG SSSS`, consistent separator | Never-issued numbers rejected: area `000`/`666`/`9xx`, group `00`, serial `0000`; not glued to other digits |
+| Email | `local@label.label…`: local part ≤ 64 chars of word characters, `.%+-` and combining marks; 2–8 labels of ≤ 63 chars of word characters and `-`. Unicode letters are allowed (`jürgen@exämple.de`, NFC or NFD) except CJK: Han, Kana and Hangul end the address, so `请联系john@example.com获取` becomes `请联系[REDACTED]获取` | Last label must be a TLD: ≥ 2 letters and not a file extension (`icon@2x.png`), or `xn--` punycode. Invalid trailing labels are trimmed (`john@example.com.123` keeps `.123`). A git SSH remote (`git@github.com:org/repo.git`) is kept as is |
+| Payment card | 13–19 digits starting with 2–6 (Visa, Mastercard, Amex, Discover, JCB, Diners, UnionPay…), either contiguous or grouped as cards are printed: first group of 4 digits, every group but the last ≥ 4 (4-4-4-4, 4-4-4-4-3, Amex 4-6-5, Diners 4-6-4), one separator between groups, all dash-like or all space-like | **Luhn checksum**; not glued to other digits; the longest valid prefix that ends on a group boundary. So `2 3 5 7 11 13…`, dates and a phone number before a card are not cards |
+| US SSN | `AAA-GG-SSSS` or `AAA GG SSSS`: both separators dash-like or both space-like (`123-45 6789` is not an SSN) | Never-issued numbers rejected: area `000`/`666`/`9xx`, group `00`, serial `0000`; not glued to other digits |
+
+Separators are one shared class: ASCII space and hyphen-minus, plus what LLMs and word processors
+emit: U+2010 hyphen, **U+2011 non-breaking hyphen**, figure, en and em dashes, U+2212 minus, small
+and fullwidth hyphen-minus; NBSP, the U+2000–U+200A spaces (figure, thin…), U+202F narrow NBSP,
+U+205F and U+3000.
 
 Every match is replaced by `[REDACTED]`. The replacement string is configurable.
 
@@ -135,9 +193,12 @@ first detector that matches *and* passes its validator wins: the span is replace
 resumes after it. If none applies, scanning moves one character right. Two consequences:
 
 - An email that contains digits (`4111111111111111@example.com`) is redacted as one email.
-- In a long run of digit groups the leftmost group start wins, and from there the **longest
-  Luhn-valid run that ends on a group boundary**. So `4111 1111 1111 1111 2 times` becomes
-  `[REDACTED] 2 times` instead of leaking the card because the trailing `2` broke the checksum.
+- In a run of digit groups the leftmost group start that begins a card wins, and from there the
+  **longest Luhn-valid run that ends on a group boundary**. So `4111 1111 1111 1111 2 times`
+  becomes `[REDACTED] 2 times` instead of leaking the card because the trailing `2` broke the
+  checksum, and `call 555 0100 4111 1111 1111 1111` becomes `call 555 0100 [REDACTED]`.
+- A git remote is skipped as a whole, so `it@github.com` inside `git@github.com:…` is not
+  redacted either.
 
 ### How streaming works
 
@@ -158,11 +219,14 @@ resumes after it. If none applies, scanning moves one character right. Two conse
 #### Why decisions before the hold point are final
 
 The detector regexes only consume characters from small alphabets, every quantifier is bounded
-and **possessive** (no backtracking), and validators look at most one character past a match. If
-any detector, starting at position `s`, read up to the end of the buffer, the text from `s` would
-itself be a viable prefix, so `s` would be at or after the hold point. So every decision before the
-hold point uses only characters that are already in the buffer, and it is the decision one-shot
-redaction makes on the full text. This gives two invariants:
+and **possessive** (no backtracking), there are no lookaheads, and validators look at most one
+character past a match. If any detector, starting at position `s`, read up to the end of the
+buffer, it consumed everything from `s`, so that text would itself be a viable prefix and `s`
+would be at or after the hold point. So every decision before the hold point uses only characters
+that are already in the buffer, and it is the decision one-shot redaction makes on the full text.
+The tail patterns may over-approximate (accept more than a detector can consume): that only holds
+text a little longer. The email tail uses plain `\w` classes for speed and the held part is then
+cut at the last CJK character, which no detector consumes. This gives two invariants:
 
 | Invariant | Test |
 |-----------|------|
@@ -189,23 +253,23 @@ word, a partial email, or a partial digit group.
 
 | | Bound |
 |-|-------|
-| Held tail | ≤ 64 chars for a run of word characters without `@` (the longest possible local part), ≤ 576 for `local@domain`, ≤ 38 for digit groups. Prose: one word. |
+| Held tail | ≤ 64 chars for a run of word characters without `@` (the longest possible local part), ≤ 576 for `local@domain` (64 + 1 + 8 labels of 63 + 7 dots), ≤ 38 for digit groups (19 digits, 19 one-character separators). Prose: one word. CJK prose: nothing. |
 | Memory per stream | O(`MAX_BUFFERED`) = 577 chars per choice/field, plus one partial SSE line, independent of response length |
 | Work per `feed()` | O(len(chunk) + held tail). Candidates are found by C-level regex scans. `@` and number lookups are cached, so even one-shot redaction of a large text with many rejected candidates stays linear. |
 
 ## Tests
 
-`pytest` runs 129 tests in about 6 s, deterministic and with no fixed ports.
+`pytest` runs 253 tests in about 8 s, deterministic and with no fixed ports.
 `HYPOTHESIS_PROFILE=thorough pytest` runs 20,000 random examples per property.
 
 | Area | What is proven |
 |------|----------------|
-| Engine (`test_redaction*.py`) | Detector semantics; **streaming == one-shot for any chunking** (Hypothesis + exhaustive 2/3-way splits); buffer ≤ `MAX_BUFFERED` after every chunk; nothing held across `\n`; long runs released |
-| SSE (`test_sse.py`) | Same events for every byte split point, byte-by-byte and random splits (UTF-8, `\r\n`, `\r`) |
-| Chunk transformer (`test_completions.py`) | Per-choice isolation for `n=2`, tool-call arguments, flush-before-`finish_reason` ordering, `[DONE]`/EOF flush, dropped empty chunks |
-| Gateway (`test_gateway.py`) | Redacted SSE, credential handling, sanitized error mapping, mid-stream failure, **disconnect cancels upstream** |
-| Latency and memory (`test_streaming_latency.py`) | **First safe delta reaches the client while the upstream is blocked** waiting for it (a buffering gateway deadlocks); held text waits for one delta only; redactor peak < 64 chars over 5,000+ deltas; traced memory ~100 KB for a 1 MB stream |
-| Real sockets (`test_end_to_end.py`) | Same guarantees over uvicorn + loopback TCP, including disconnect cancellation |
+| Engine (`test_redaction*.py`) | Detector semantics, including Unicode separators, card groupings, IIN, false-positive regressions (number lists, dates, a phone before a card), CJK boundaries, file names and git remotes; **streaming == one-shot for any chunking** (Hypothesis with the new separators, CJK, NBSP and combining marks in its alphabets, plus exhaustive 2/3-way splits); buffer ≤ `MAX_BUFFERED` after every chunk and exactly `MAX_BUFFERED` at the worst case; nothing held across `\n`; CJK prose never held; long runs released |
+| SSE (`test_sse.py`) | Same events for every byte split point, byte-by-byte and random splits (UTF-8, `\r\n`, `\r`, a leading BOM); a 900 KB line in 256-byte reads parses in linear time (timing guard); events before an oversized one are kept; a failed parser stays failed |
+| Chunk transformer (`test_completions.py`) | Every delta and message field redacted (content parts, reasoning, audio transcript, tool and legacy function arguments, unknown fields), structural values intact, logprobs dropped, tool calls keyed by `index`; Hypothesis: any interleaving of fields and choices reads as one-shot redaction, with nothing after `finish_reason`; `[DONE]`/EOF flush, dropped empty chunks |
+| Gateway (`test_gateway.py`) | Redacted SSE, credential handling, refused logprobs/audio, sanitized error mapping (non-2xx, lone surrogates, deep JSON, unexpected exceptions in-band and as a 500), mid-stream failure, **disconnect cancels upstream** before the status line, while reading a complete answer and while streaming |
+| Latency and memory (`test_streaming_latency.py`) | **First safe delta reaches the client while the upstream is blocked** waiting for it (a buffering gateway deadlocks); held text waits for one delta only; within a burst, the event loop runs after every event written; redactor peak < 64 chars over 5,000+ deltas; traced memory ~100 KB for a 1 MB stream |
+| Real sockets (`test_end_to_end.py`) | Same guarantees over uvicorn + loopback TCP, including disconnect cancellation; a raw socket closed while the provider is still thinking (streaming or not) makes the gateway hang up on the provider; a provider that goes silent mid-stream gets an in-band `upstream_timeout` after `READ_TIMEOUT`; `n=3` interleaved choices each read as one-shot redaction |
 
 `httpx.ASGITransport` buffers the whole response, so it cannot show streaming. The tests drive the
 gateway through the raw ASGI interface (`tests/asgi.py`) and reach the mock provider through
@@ -215,62 +279,89 @@ with backpressure.
 ## Benchmarks
 
 ```bash
-python benchmarks/bench_redactor.py     # ~1 min; --quick for a smoke run
+python benchmarks/bench_redactor.py     # about 35 s; --quick for a smoke run
 ```
 
-Measured on a busy Windows 11 laptop, Python 3.12. For section 3, the servers run in a child
-process and every path is hit in interleaved order.
+Measured on a busy Windows 11 laptop, Python 3.12. For section 3, the mock and both gateways run
+on uvicorn in a child process, so the client's timing is not skewed by the servers' work, and
+every path is hit in interleaved order.
 
 **1. Engine** (`StreamRedactor.feed()`, 200 KB of LLM-like text with PII about every KB):
 
 | chunk size | µs per chunk | of which redaction | throughput |
 |---:|---:|---:|---:|
-| 1 char | 1.07 | 1.04 | 0.9 MB/s |
-| 4 chars (≈ 1 token) | 1.22 | 1.19 | 3.3 MB/s |
-| 64 chars | 4.31 | 4.28 | 14.9 MB/s |
-| 4 KB | 207 | 207 | 19.7 MB/s |
+| 1 char | 1.04 | 1.01 | 1.0 MB/s |
+| 4 chars (≈ 1 token) | 1.15 | 1.12 | 3.5 MB/s |
+| 64 chars | 4.09 | 4.07 | 15.6 MB/s |
+| 4 KB | 205 | 205 | 19.9 MB/s |
 
 **2. Gateway pipeline per upstream event** (4-char deltas): 3.0 µs to parse and re-encode the SSE
-event, 9.3 µs with JSON and redaction, so **the guardrail adds about 6 µs of CPU per token**. A
-model emitting 100 tokens/s costs under 0.1 % of a core.
+event, 9.7 µs with JSON and redaction of every field of the delta, so **the guardrail adds about
+7 µs of CPU per token**. A model emitting 100 tokens/s costs under 0.1 % of a core.
 
 **3. End to end over loopback TCP** (p50 / p95 ms, 200 unpaced and 20 paced requests per path):
 
 | path | first byte | first content | total |
 |---|---:|---:|---:|
 | *mock answers instantly* | | | |
-| direct to mock | 3.95 / 5.64 | 4.00 / 5.89 | 6.69 / 10.20 |
-| gateway, redaction off | 7.16 / 11.94 | 11.07 / 17.66 | 13.92 / 21.62 |
-| gateway, redaction on | 7.12 / 12.77 | 12.20 / 20.57 | 14.55 / 24.53 |
+| direct to mock | 1.74 / 2.81 | 1.77 / 2.84 | 2.94 / 4.54 |
+| gateway, redaction off | 3.25 / 4.06 | 3.31 / 4.14 | 7.44 / 8.91 |
+| gateway, redaction on | 3.28 / 4.68 | 3.41 / 4.83 | 7.81 / 9.45 |
 | *TTFT 50 ms, then a 4-char delta every 20 ms* | | | |
-| direct to mock | 66.30 / 73.87 | 66.73 / 74.16 | 410.05 / 423.33 |
-| gateway, redaction off | 71.27 / 75.65 | 71.51 / 76.32 | 417.18 / 426.28 |
-| gateway, redaction on | 69.29 / 81.35 | 99.98 / 112.09 | 417.91 / 435.16 |
+| direct to mock | 59.32 / 76.37 | 59.47 / 76.60 | 403.68 / 417.53 |
+| gateway, redaction off | 60.78 / 76.89 | 61.06 / 77.23 | 406.22 / 430.78 |
+| gateway, redaction on | 59.16 / 75.58 | 88.64 / 106.04 | 402.08 / 421.18 |
 
 What this shows:
 
 - **Time to first byte does not change** with redaction on. The role chunk is forwarded as soon as
-  it arrives. The proxy hop itself (uvicorn + httpx on Windows loopback) costs about 3 ms.
-- **Total stream time does not change** either: about 0.6 ms more over 65 deltas when the upstream
-  is instant, and within noise at realistic pacing.
+  it arrives. The proxy hop itself (uvicorn + httpx on Windows loopback) costs about 1.5 ms.
+- **A burst is forwarded event by event.** When the mock answers instantly, one upstream read
+  carries most of the answer. A server's `send()` usually returns without yielding, and on
+  asyncio's Proactor loop (Windows) only the first write then reaches the socket until the loop
+  runs again, so the whole burst used to be redacted before anything went out (first content
+  6.1 ms with redaction, 5.3 ms without, in the previous version). The relay now lets the loop run
+  after each event: first content 3.4 ms. The price is one loop iteration per event: the total for
+  65 instant deltas went from 7.3 to 7.8 ms with redaction (6.6 to 7.4 ms without). Redaction
+  itself adds about 0.4 ms to it; at realistic pacing total time is within noise.
 - **First content can arrive one delta later.** The mock's first delta is `Sure`, which could still
   become `Sure@example.com`, so it waits for `! He` (20 ms here, plus Windows timer granularity).
   This is the minimum price of never leaking a pattern split across chunks. A first delta that ends
-  in a space or punctuation is forwarded at once (`test_first_safe_chunk…`).
+  in a space or punctuation is forwarded at once (`test_first_safe_chunk…`). The same wait applies
+  to the last word of each delta (see *Latency* above).
 
 ## Known limitations
 
 - **Request side is not filtered.** Only the model's output is redacted; prompts go upstream
   unchanged. Client authentication is also out of scope: run the gateway behind your API gateway.
+- **Output that cannot be redacted as text is refused**, not filtered: token `logprobs` and audio
+  output get a 400.
+- **Streams without `choices` are redacted per event.** For a provider that does not speak the
+  OpenAI chunk format (TGI's `{"token": {"text": …}}`, say), each event is redacted on its own, so
+  a pattern split across two events is not caught.
 - **Tool-call arguments are redacted as text.** `{"email": "a@b.co"}` stays valid JSON, but a card
   number written as a bare JSON number becomes `[REDACTED]` and makes the arguments invalid JSON.
   This is deliberate: breaking the call beats leaking the number. JSON-escaped PII
-  (`a@b.co`) is not decoded first. The legacy `function_call` field is not covered.
-- **Obfuscated PII** (`john at example dot com`, digits spelled out, homoglyphs, full-width digits)
-  is not detected. Only ASCII digits count for cards and SSNs.
+  (`a\u0040b.co`) is not decoded first.
+- **Unknown fields are treated as text streams.** A string field the gateway does not know (an
+  annotation URL, say) may have its last word held back and delivered in a later chunk, which is
+  harmless for clients that concatenate deltas. Text split across two *different* fields is not
+  joined. Redaction also shifts character offsets, so `annotations[].start_index`/`end_index`
+  can point at the wrong text.
+- **Obfuscated PII** (`john at example dot com`, digits spelled out, homoglyphs, full-width digits,
+  zero-width characters, Markdown inside the number such as `4111 **1111** …`) is not detected.
+  Only ASCII digits count for cards and SSNs, dots are not separators (`4111.1111.1111.1111`), and
+  a separator is one character (`4111  1111` with two spaces is two numbers).
+- **Separator kinds are not mixed.** `123-45 6789` or `4111-1111 1111-1111` is not matched; mixed
+  dashes (`-` and U+2011) or mixed spaces (space and NBSP) are.
 - **Bare 9-digit SSNs** (`123456789`) are not redacted. Without separators they cannot be told
-  apart from order numbers, ZIP+4 codes and so on.
+  apart from order numbers, ZIP+4 codes and so on. A phone number written `212 55 1234` has the
+  SSN shape and is redacted.
+- **Cards outside IIN 2–6** (UATP `1…`, some RuPay `8…`) and unusual groupings (a first group
+  other than 4 digits) are not detected. Among 2–6 numbers, roughly 1 in 10 random contiguous
+  13–19 digit ids passes Luhn and is redacted too.
+- **CJK addresses.** Because CJK text ends an address, an address written in CJK script
+  (`用户@例子.中国`) is not detected; its punycode form is. Only `git@…` remotes are recognised as
+  non-addresses; `deploy@host:/path` is still redacted.
 - Emails with more than 8 host labels or a local part longer than 64 characters are outside the
   grammar. For the latter, only the last 64 characters before `@` and the domain are redacted.
-- Card detection is checksum-based, so roughly 1 in 10 random 13–19 digit numbers that happen to
-  pass Luhn are redacted too.

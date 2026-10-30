@@ -23,6 +23,7 @@ class ASGIResponse:
         self.status = 0
         self.headers: dict[str, str] = {}
         self.complete = False
+        self.app_done = anyio.Event()
 
     async def start(self) -> None:
         message = await self._messages.receive()
@@ -53,8 +54,16 @@ class ASGIResponse:
 
 @asynccontextmanager
 async def asgi_request(
-    app: ASGIApp, path: str, body: Any, headers: dict[str, str] | None = None, method: str = "POST"
+    app: ASGIApp,
+    path: str,
+    body: Any,
+    headers: dict[str, str] | None = None,
+    method: str = "POST",
+    wait_for_start: bool = True,
 ) -> AsyncIterator[ASGIResponse]:
+    """Run one request. With ``wait_for_start=False`` the response is handed over before the app
+    has sent anything, so a test can disconnect while the app is still waiting on its upstream;
+    ``app_done`` is set when the app returns."""
     raw = body if isinstance(body, bytes) else json.dumps(body).encode()
     sent_body = False
     disconnect = anyio.Event()
@@ -89,16 +98,21 @@ async def asgi_request(
         "state": {},
     }
 
+    response = ASGIResponse(receive_stream, disconnect)
+
     async def run_app() -> None:
-        async with send_stream:
-            await app(scope, receive, send)
+        try:
+            async with send_stream:
+                await app(scope, receive, send)
+        finally:
+            response.app_done.set()
 
     with receive_stream:
         async with anyio.create_task_group() as tg:
             tg.start_soon(run_app)
-            response = ASGIResponse(receive_stream, disconnect)
-            with anyio.fail_after(10):
-                await response.start()
+            if wait_for_start:
+                with anyio.fail_after(10):
+                    await response.start()
             try:
                 yield response
             finally:

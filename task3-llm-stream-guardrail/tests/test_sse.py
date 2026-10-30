@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import codecs
 import itertools
+import time
 
 import pytest
 from hypothesis import given
@@ -90,6 +92,71 @@ def test_oversized_event_is_rejected() -> None:
     with pytest.raises(SSEError):
         for _ in range(30):
             parser.feed(b"data: xxxxxx\n")
+
+
+BOM = codecs.BOM_UTF8  # EF BB BF
+
+
+def test_a_leading_bom_is_stripped_wherever_the_bytes_split() -> None:
+    stream = BOM + STREAM
+    assert parse([stream]) == EXPECTED
+    for i in range(len(BOM) + 4):  # splits inside the BOM's three bytes and just after it
+        assert parse([stream[:i], stream[i:]]) == EXPECTED, i
+    assert parse([stream[i : i + 1] for i in range(len(stream))]) == EXPECTED
+
+
+def test_only_one_leading_bom_is_stripped() -> None:
+    # A second BOM, or one later in the stream, is part of a field name (U+FEFF then "data"),
+    # which is unknown, so the line is ignored as the spec says.
+    assert parse([BOM + BOM + b"data: a\n\n"]) == []
+    assert parse([b"data: a\n\n" + BOM + b"data: b\n\n"]) == [SSEEvent(data="a")]
+
+
+def test_a_long_line_in_small_reads_costs_linear_time() -> None:
+    # 900 KB in 256-byte reads (3,600 reads). Rebuilding and rescanning the partial line on every
+    # read took ~10 s here; linear parsing takes milliseconds. The bound is generous for slow CI.
+    payload = b"data: " + b"x" * (900 << 10) + b"\r"
+    reads = [payload[i : i + 256] for i in range(0, len(payload), 256)]
+    parser = SSEParser()
+    started = time.perf_counter()
+    events = [event for read in reads for event in parser.feed(read)]
+    events += parser.feed(b"\n\r\n") + parser.close()  # the CRLF is split across reads
+    elapsed = time.perf_counter() - started
+    assert events == [SSEEvent(data="x" * (900 << 10))]
+    assert elapsed < 2.0, f"{elapsed:.2f} s"
+
+
+def test_a_line_split_across_many_reads_is_joined_once_and_correctly() -> None:
+    parser = SSEParser()
+    assert parser.feed(b"da") == []
+    assert parser.feed(b"ta: hel") == []
+    assert parser.feed(b"lo\r") == []
+    assert parser.feed(b"\ndata: wor") == []  # "\r" + "\n" is one line ending
+    assert parser.feed(b"ld\n\n") == [SSEEvent(data="hello\nworld")]
+
+
+def test_events_before_an_oversized_event_are_kept() -> None:
+    # One read carries two good events and the start of an oversized one.
+    parser = SSEParser(max_event_size=100)
+    with pytest.raises(SSEError) as caught:
+        parser.feed(b"data: one\n\ndata: two\n\ndata: " + b"x" * 200)
+    assert caught.value.events == [SSEEvent(data="one"), SSEEvent(data="two")]
+    # The same when the limit is crossed by complete lines of one event.
+    parser = SSEParser(max_event_size=100)
+    with pytest.raises(SSEError) as caught:
+        parser.feed(b": ping\n\n" + b"data: xxxxxxxxxx\n" * 20)
+    assert caught.value.events == [SSEEvent(comments=["ping"])]
+
+
+def test_a_failed_parser_stays_failed() -> None:
+    parser = SSEParser(max_event_size=10)
+    with pytest.raises(SSEError):
+        parser.feed(b"data: " + b"x" * 20)
+    with pytest.raises(SSEError) as caught:
+        parser.feed(b"\n\ndata: ok\n\n")
+    assert caught.value.events == []
+    with pytest.raises(SSEError):
+        parser.close()
 
 
 def test_encode_round_trip() -> None:

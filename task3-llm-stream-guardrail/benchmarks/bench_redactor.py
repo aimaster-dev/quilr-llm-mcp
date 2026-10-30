@@ -1,13 +1,14 @@
 """Benchmarks for the streaming PII guardrail.
 
-    python benchmarks/bench_redactor.py            # about 30 s
+    python benchmarks/bench_redactor.py            # about 35 s
     python benchmarks/bench_redactor.py --quick    # fewer iterations, for a smoke run
 
 1. Engine: cost of ``StreamRedactor.feed()`` per chunk, by chunk size, against a pass-through.
 2. Gateway pipeline: CPU per upstream event for SSE parse -> JSON -> redact -> JSON -> SSE,
    against the same proxy pipeline without redaction (parse -> encode).
-3. End to end over loopback TCP, with the mock provider and the gateway on uvicorn in this process:
-   time to first byte, time to first content and total time, measured directly against the mock,
+3. End to end over loopback TCP: the mock provider and two gateways (redaction on and off) run on
+   uvicorn in a child process, so the client's timing is not skewed by the servers' work. It
+   measures time to first byte, time to first content and total time, directly against the mock,
    through the gateway with redaction disabled, and through the gateway with redaction.
 """
 
