@@ -22,11 +22,11 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
-from typing import Any
+from typing import Annotated, Any
 
 import anyio
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError
 
 from llm_router.errors import (
     UpstreamError,
@@ -157,17 +157,32 @@ class _UpstreamChoice(BaseModel):
     finish_reason: str | None = None
 
 
+def _count_or_none(value: Any) -> int | None:
+    # usage is metadata: a malformed count is dropped (and the reservation kept) rather than
+    # turning a valid completion into a bad response that would be failed over.
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def _mapping_or_none(value: Any) -> Any:
+    return value if isinstance(value, Mapping) else None
+
+
+_TokenCount = Annotated[int | None, BeforeValidator(_count_or_none)]
+
+
 class _UpstreamUsage(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    prompt_tokens: int | None = Field(default=None, ge=0)
-    completion_tokens: int | None = Field(default=None, ge=0)
-    total_tokens: int | None = Field(default=None, ge=0)
+    prompt_tokens: _TokenCount = None
+    completion_tokens: _TokenCount = None
+    total_tokens: _TokenCount = None
 
 
 class _UpstreamCompletion(BaseModel):
     model_config = ConfigDict(extra="ignore")
     choices: list[_UpstreamChoice] = Field(min_length=1)
-    usage: _UpstreamUsage | None = None
+    usage: Annotated[_UpstreamUsage | None, BeforeValidator(_mapping_or_none)] = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +191,7 @@ class Completion:
 
     route: str
     choices: list[dict[str, Any]]
+    #: The provider's own counts, malformed fields dropped. Not yet checked for plausibility.
     usage: dict[str, int] | None
     #: Prior failed attempts (e.g. the primary that timed out), for logging.
     failed_attempts: tuple[AttemptFailure, ...] = ()
@@ -335,8 +351,9 @@ def _interpret(
         # ValueError also covers JSONDecodeError and UnicodeDecodeError.
         detail = f"{type(exc).__name__}: {_snippet(raw)}"
         raise _failure(upstream, FailureKind.BAD_RESPONSE, started, status=status, detail=detail) from None
+    usage = parsed.usage.model_dump(exclude_none=True) if parsed.usage else None
     return Completion(
         route=upstream.label,
         choices=[choice.model_dump() for choice in parsed.choices],
-        usage=parsed.usage.model_dump(exclude_none=True) if parsed.usage else None,
+        usage=usage or None,
     )

@@ -62,3 +62,29 @@ def request_cost(prompt_tokens: int, max_tokens: int) -> int:
     if prompt_tokens < 0 or max_tokens < 0:
         raise ValueError("token counts must be non-negative")
     return prompt_tokens + max_tokens
+
+
+def max_plausible_usage(prompt_tokens: int, max_tokens: int) -> int:
+    """The most tokens a correct provider can report for a request.
+
+    * The completion is capped by ``max_tokens``, which the gateway always sends upstream.
+    * A token covers at least one byte of text (byte-level BPE and byte-fallback tokenizers), so
+      the real prompt is at most ``BYTES_PER_TOKEN`` times its ``bytes / BYTES_PER_TOKEN``
+      estimate. Multiplying the per-message overhead too leaves room for chat-template tokens.
+    """
+    return max_tokens + BYTES_PER_TOKEN * prompt_tokens
+
+
+def accepted_usage(reported: int | None, *, prompt_tokens: int, max_tokens: int) -> int | None:
+    """The provider-reported total to charge, or ``None`` to keep the gateway's own reservation.
+
+    A report is accepted only if a correct provider could have produced it for this request:
+    ``1 <= reported <= max_plausible_usage(...)``. Anything else (zero, which some servers send
+    when they do not count, negative, absurdly large, missing) says nothing about the real usage,
+    so neither it nor a clamped version of it is charged. The reservation (prompt estimate plus
+    ``max_tokens``) is the gateway's own bound and is kept instead: a broken provider can neither
+    make requests free nor lock a tenant out.
+    """
+    if reported is None or not 1 <= reported <= max_plausible_usage(prompt_tokens, max_tokens):
+        return None
+    return reported

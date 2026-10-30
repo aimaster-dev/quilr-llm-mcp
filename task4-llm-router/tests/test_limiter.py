@@ -18,6 +18,7 @@ from llm_router.keys import fingerprint_api_key
 from llm_router.limiter import (
     DEFAULT_TOKENS_PER_WINDOW,
     DEFAULT_WINDOW_SECONDS,
+    MAX_ROW_TOKENS,
     AsyncTokenRateLimiter,
     LimitDecision,
     Outcome,
@@ -35,7 +36,10 @@ def test_defaults_match_the_spec(make_limiter) -> None:
     assert (limiter.limit, limiter.window) == (50_000, 60.0)
 
 
-@pytest.mark.parametrize("kwargs", [{"limit_tokens": 0}, {"window_seconds": 0}, {"busy_timeout_ms": -1}])
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"limit_tokens": 0}, {"limit_tokens": 2**40 + 1}, {"window_seconds": 0}, {"busy_timeout_ms": -1}],
+)
 def test_rejects_invalid_configuration(make_limiter, kwargs) -> None:
     with pytest.raises(ValueError):
         make_limiter(**kwargs)
@@ -203,11 +207,15 @@ def test_release_frees_the_reservation_once(make_limiter) -> None:
     assert limiter.reserve(TENANT_A, 1_000).admitted
 
 
-def test_reconcile_rejects_negative_usage(make_limiter) -> None:
+@pytest.mark.parametrize("tokens", [-1, MAX_ROW_TOKENS + 1, 2**63])
+def test_reconcile_rejects_out_of_range_usage(make_limiter, tokens: int) -> None:
+    # 2**63 would raise OverflowError inside sqlite3; anything above MAX_ROW_TOKENS could later make
+    # SUM() overflow and lock the tenant out. Both are refused up front and the row is unchanged.
     limiter = make_limiter()
     decision = limiter.reserve(TENANT_A, 10)
     with pytest.raises(ValueError):
-        limiter.reconcile(decision.reservation_id, -1)
+        limiter.reconcile(decision.reservation_id, tokens)
+    assert limiter.usage(TENANT_A) == 10
 
 
 # -- eviction ------------------------------------------------------------------------------------

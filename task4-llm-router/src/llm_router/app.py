@@ -6,11 +6,13 @@ Request flow::
     -> read + validate body          (400 / 413)
     -> estimate cost, reserve tokens (413 too large, 429 rate limited)
     -> route: primary, maybe secondary
-    -> success: reconcile the reservation with the provider's usage
+    -> success: reconcile the reservation with the provider's usage (if plausible)
        failure: release the reservation, return a sanitized error
 
 Quota policy: a tenant is charged for the completion it receives, measured by the provider's
-``usage``. When no completion is returned (both providers failed, the request was rejected, the
+``usage`` when a correct provider could have reported it (``tokens.accepted_usage``), otherwise by
+the reservation itself. A completion is always returned once it exists, even if the bookkeeping
+fails. When no completion is returned (both providers failed, the request was rejected, the
 client went away) the reservation is released. While a request is in flight its reservation counts
 in full, so a tenant can never have more than its budget outstanding.
 
@@ -56,7 +58,7 @@ from llm_router.middleware import EXCEPTION_HANDLERS, MIDDLEWARE, current_reques
 from llm_router.router import Completion, ModelRouter
 from llm_router.schemas import parse_chat_request
 from llm_router.settings import Settings, load_settings
-from llm_router.tokens import estimate_prompt_tokens, request_cost
+from llm_router.tokens import accepted_usage, estimate_prompt_tokens, max_plausible_usage, request_cost
 
 logger = logging.getLogger(__name__)
 
@@ -168,7 +170,8 @@ async def chat_completions(request: Request) -> Response:
         )
 
     max_tokens = chat.max_tokens or settings.default_max_tokens
-    cost = request_cost(estimate_prompt_tokens(chat.messages_payload()), max_tokens)
+    prompt_tokens = estimate_prompt_tokens(chat.messages_payload())
+    cost = request_cost(prompt_tokens, max_tokens)
 
     # Shielded: once the reservation transaction has run we must learn its id, or a cancelled
     # request would leave tokens reserved until the window drains.
@@ -225,22 +228,36 @@ async def chat_completions(request: Request) -> Response:
         )
         return _NoResponse()
 
-    actual = completion.total_tokens
-    with anyio.CancelScope(shield=True):
-        try:
-            remaining = await gateway.limiter.reconcile(
-                decision.reservation_id, actual if actual is not None else cost
-            )
-        except sqlite3.Error:
-            # Fail safe: the reservation keeps its (upper-bound) estimate.
-            logger.exception("could not reconcile reservation %s", decision.reservation_id)
-            remaining = None
+    # From here on a completion exists: whatever happens to the bookkeeping, the client gets it.
+    reported = completion.total_tokens
+    charged = accepted_usage(reported, prompt_tokens=prompt_tokens, max_tokens=max_tokens)
+    if charged is None and reported is not None:
+        logger.warning(
+            "ignoring implausible provider usage total=%d (possible for this request: 1..%d); "
+            "the %d-token reservation is kept",
+            reported,
+            max_plausible_usage(prompt_tokens, max_tokens),
+            cost,
+        )
+    remaining: int | None = None
+    if charged is not None and charged != cost:
+        with anyio.CancelScope(shield=True):
+            try:
+                remaining = await gateway.limiter.reconcile(decision.reservation_id, charged)
+            except Exception:
+                # Fail safe: the reservation keeps its (upper-bound) estimate.
+                logger.exception(
+                    "could not reconcile reservation %s; it keeps its %d-token estimate",
+                    decision.reservation_id,
+                    cost,
+                )
     logger.info(
-        "completion served route=%s tenant=%s estimate=%d actual=%s failed_attempts=%d",
+        "completion served route=%s tenant=%s estimate=%d reported=%s charged=%d failed_attempts=%d",
         completion.route,
         log_tenant,
         cost,
-        actual,
+        reported,
+        cost if charged is None else charged,
         len(completion.failed_attempts),
     )
 
@@ -251,7 +268,8 @@ async def chat_completions(request: Request) -> Response:
         "model": chat.model or "default",
         "choices": completion.choices,
     }
-    if completion.usage is not None:
+    if charged is not None and completion.usage is not None:
+        # Relayed only when plausible: the gateway does not pass on numbers it refused to charge.
         body["usage"] = completion.usage
     headers = _rate_limit_headers(decision.limit, decision.remaining if remaining is None else remaining)
     headers[ROUTE_HEADER] = completion.route

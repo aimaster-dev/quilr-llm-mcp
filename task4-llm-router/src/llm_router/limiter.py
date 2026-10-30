@@ -50,6 +50,10 @@ DEFAULT_TOKENS_PER_WINDOW = 50_000
 DEFAULT_WINDOW_SECONDS = 60.0
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 SCHEMA_VERSION = 1
+#: Largest token count a row may hold: far above any real request, and small enough that SUM()
+#: over a tenant's rows can never overflow SQLite's 64-bit INTEGER (which would make every later
+#: reservation for that tenant fail).
+MAX_ROW_TOKENS = 2**40
 
 _SCHEMA = (
     """
@@ -115,8 +119,8 @@ class TokenRateLimiter:
         clock: Clock = time.time,
         busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
     ) -> None:
-        if limit_tokens < 1:
-            raise ValueError("limit_tokens must be at least 1")
+        if not 1 <= limit_tokens <= MAX_ROW_TOKENS:
+            raise ValueError(f"limit_tokens must be between 1 and {MAX_ROW_TOKENS}")
         if window_seconds <= 0:
             raise ValueError("window_seconds must be positive")
         if busy_timeout_ms < 0:
@@ -260,8 +264,8 @@ class TokenRateLimiter:
         Returns the tenant's remaining tokens in the current window, or ``None`` if the reservation
         no longer exists (already released, or older than the window and evicted).
         """
-        if actual_tokens < 0:
-            raise ValueError("actual_tokens must not be negative")
+        if not 0 <= actual_tokens <= MAX_ROW_TOKENS:
+            raise ValueError(f"actual_tokens must be between 0 and {MAX_ROW_TOKENS}")
         with self._lock, self._immediate(self._conn) as conn:
             row = conn.execute("SELECT tenant FROM reservations WHERE id = ?", (reservation_id,)).fetchone()
             if row is None:

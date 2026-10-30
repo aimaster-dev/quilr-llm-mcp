@@ -106,6 +106,89 @@ async def test_missing_usage_is_charged_at_the_estimate(tmp_path: Path) -> None:
         assert await gw.usage() == COST
 
 
+# -- reconciling with the provider's usage -------------------------------------------------------
+
+PROMPT_ESTIMATE = 17  # see tests.gateway.PROMPT
+MAX_PLAUSIBLE = (COST - PROMPT_ESTIMATE) + 4 * PROMPT_ESTIMATE  # max_tokens + 4 x prompt estimate
+NO_USAGE = object()
+
+
+def completion_with_usage(usage: object) -> dict:
+    body = completion_body("hi", total_tokens=None)
+    if usage is not NO_USAGE:
+        body["usage"] = usage
+    return body
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        pytest.param({"total_tokens": 2**63}, id="2**63"),
+        pytest.param({"total_tokens": 10**15}, id="10**15"),
+        pytest.param({"total_tokens": MAX_PLAUSIBLE + 1}, id="just-above-possible"),
+        pytest.param({"prompt_tokens": 9, "completion_tokens": 40_000}, id="ignored-max_tokens"),
+        pytest.param({"total_tokens": 0}, id="zero"),
+        pytest.param({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, id="all-zero"),
+        pytest.param({"total_tokens": -5}, id="negative"),
+        pytest.param({"prompt_tokens": 9, "completion_tokens": -1}, id="negative-part"),
+        pytest.param({"total_tokens": "100"}, id="string"),
+        pytest.param({"total_tokens": True}, id="bool"),
+        pytest.param({"prompt_tokens": 9}, id="prompt-only"),
+        pytest.param("n/a", id="not-an-object"),
+        pytest.param(None, id="null"),
+        pytest.param(NO_USAGE, id="missing"),
+    ],
+)
+async def test_implausible_or_missing_usage_keeps_the_reservation_and_still_serves(
+    tmp_path: Path, usage: object
+) -> None:
+    """A broken provider can neither crash the request, lock the tenant out nor make it free."""
+    primary, secondary = Recorder(respond(200, json_body=completion_with_usage(usage))), Recorder(ok())
+    async with running_gateway(make_settings(tmp_path), primary, secondary) as gw:
+        response = await gw.chat()
+        charged = await gw.usage()
+
+    assert response.status_code == 200
+    assert response.headers["x-gateway-route"] == "primary"  # a valid completion is not failed over
+    assert response.json()["choices"][0]["message"]["content"] == "hi"
+    assert "usage" not in response.json()  # numbers the gateway refused to charge are not relayed
+    assert charged == COST
+    assert response.headers["x-ratelimit-remaining"] == str(10_000 - COST)
+    assert secondary.requests == []
+
+
+@pytest.mark.parametrize("total", [1, PROMPT_ESTIMATE, COST - 1, COST + 1, MAX_PLAUSIBLE])
+async def test_plausible_usage_is_recorded_exactly(tmp_path: Path, total: int) -> None:
+    # Above the reservation is possible (the prompt estimate is not an upper bound) and recorded too.
+    async with running_gateway(make_settings(tmp_path), Recorder(ok(total_tokens=total))) as gw:
+        response = await gw.chat()
+        charged = await gw.usage()
+    assert response.status_code == 200
+    assert response.json()["usage"]["total_tokens"] == total
+    assert charged == total
+    assert response.headers["x-ratelimit-remaining"] == str(10_000 - total)
+
+
+async def test_a_failing_reconcile_still_returns_the_completion(
+    tmp_path: Path, monkeypatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="llm_router")
+    async with running_gateway(make_settings(tmp_path), Recorder(ok("served", total_tokens=42))) as gw:
+
+        async def broken(*args: object) -> None:
+            raise OverflowError("Python int too large to convert to SQLite INTEGER")
+
+        monkeypatch.setattr(gw.gateway.limiter, "reconcile", broken)
+        response = await gw.chat()
+        charged = await gw.usage()
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "served"
+    assert charged == COST  # fail safe: the reservation keeps its estimate
+    [record] = [r for r in caplog.records if "could not reconcile" in r.getMessage()]
+    assert record.levelno == logging.ERROR and record.exc_info is not None
+
+
 # -- failover through the API --------------------------------------------------------------------
 
 

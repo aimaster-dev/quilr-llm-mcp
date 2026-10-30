@@ -173,9 +173,23 @@ database is unavailable fails closed with `503 rate_limiter_unavailable`.
   from being under-counted. `max_tokens` is always sent upstream (the default too), so the provider
   cannot generate more than was reserved.
 - **Reconcile** on success: the row's `tokens` becomes the provider's `usage.total_tokens` (or
-  prompt + completion, or the estimate if usage is missing). It records the truth even if that
-  pushes the tenant over the limit (only possible when the prompt estimate was low). Later requests
-  are then refused until the window drains.
+  prompt + completion). It records the truth even if that pushes the tenant over the limit (only
+  possible when the prompt estimate was low). Later requests are then refused until the window
+  drains.
+- **Only plausible usage is trusted.** A correct provider reports between `1` and
+  `max_tokens + 4 × prompt_estimate` tokens: the completion is capped by `max_tokens` (always sent
+  upstream), and a token covers at least one byte, so the real prompt is at most 4× its
+  `bytes / 4` estimate (the multiplied per-message overhead leaves room for chat-template tokens).
+  A report outside that range (`0`, which some servers send when they do not count, negative,
+  `10**15`, `2**63`, a provider that ignored `max_tokens`) or a missing one carries no information,
+  so the reservation is simply kept: the tenant pays its own upper-bound estimate, never a free
+  request and never a lock-out. The value is logged at WARNING and left out of the response's
+  `usage`. Malformed usage fields are dropped rather than turning a valid completion into a bad
+  response, so they never trigger a failover. *Why not clamp?* Clamping keeps part of a number
+  already shown to be wrong: clamping `10**15` down to the ceiling would charge more than the
+  reservation, and clamping `0` up to the prompt estimate would make the completion free.
+- **The client always gets a completion that exists.** Any reconcile failure (database error,
+  out-of-range value, anything else) is logged with its traceback and the row keeps its estimate.
 - **Release** (DELETE) when no completion reaches the client: both providers failed, the request was
   rejected upstream, or the client went away. Policy: **a tenant is charged for the completion it
   receives**. A timed-out primary may have burned provider tokens, but the gateway cannot observe
@@ -317,7 +331,7 @@ pytest          # about 180 tests, ~20 s; deadlines are shortened to 250-300 ms 
 | `test_limiter.py` | window sliding and boundaries, per-tenant and sweeper eviction, exact Retry-After, reconcile (incl. over limit), release, restart persistence, raw key absent from DB/WAL bytes, 8 threads and 4 processes on separate connections admitting exactly `floor(limit/cost)`, a Hypothesis property checking every decision and Retry-After against the definition of the window |
 | `test_router.py` | 429/timeout/connect/5xx/malformed failover, policy switches, 4xx not retried, slow-drip body, real-socket check that the timed-out primary sees the connection close, late primary cancelled and never used, outer cancellation, 80 concurrent mixed requests |
 | `test_errors.py` | catalogue, catch-all 500, routing errors, secrets/hostnames/tracebacks/provider and model names never in responses but present in logs with the same request id, Hypothesis property over random secrets |
-| `test_api.py` | auth, headers, reconcile and release accounting, timeout race bounded by the deadline with only the fallback counted, client disconnect (receive channel only, no cancellation) and outer cancellation both release, exact Retry-After with an injected clock, validation without echoing input, 40 parallel requests admit exactly `floor(limit/cost)`, two app instances sharing one budget |
+| `test_api.py` | auth, headers, reconcile and release accounting (plausible usage recorded exactly; `2**63`, `10**15`, `0`, negative, malformed and missing usage keep the reservation and still serve; a failing reconcile still returns the completion), timeout race bounded by the deadline with only the fallback counted, client disconnect (receive channel only, no cancellation) and outer cancellation both release, exact Retry-After with an injected clock, validation without echoing input, 40 parallel requests admit exactly `floor(limit/cost)`, two app instances sharing one budget |
 | `test_e2e.py` | uvicorn on ephemeral ports: slow and drip primaries fail over at the deadline and see the gateway hang up; a client that gives up after 0.5 s gets its primary attempt cancelled before the deadline, usage 0 and no secondary call; full failover / 503 / 429 walkthrough |
 
 ## Limitations and trade-offs

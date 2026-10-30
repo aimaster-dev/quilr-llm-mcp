@@ -134,13 +134,21 @@ async def test_only_whitelisted_response_fields_are_kept() -> None:
         ({"prompt_tokens": 5, "completion_tokens": 7}, 12),
         ({"prompt_tokens": 5}, None),
         (None, None),
+        # Malformed counts are dropped, never a reason to discard (and fail over) a completion.
+        ({"prompt_tokens": 5, "completion_tokens": -7, "total_tokens": -2}, None),
+        ({"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": "12"}, 12),
+        ({"total_tokens": 1.5}, None),
+        ({"total_tokens": False}, None),
+        ([1, 2, 3], None),
+        ("lots", None),
     ],
 )
-async def test_total_tokens_falls_back_sensibly(usage: dict | None, expected: int | None) -> None:
+async def test_total_tokens_falls_back_sensibly(usage: object, expected: int | None) -> None:
     body = completion_body(total_tokens=None)
     if usage is not None:
         body["usage"] = usage
     completion = await run(make_router(Recorder(respond(200, json_body=body)), None))
+    assert completion.route == "primary"
     assert completion.total_tokens == expected
 
 
