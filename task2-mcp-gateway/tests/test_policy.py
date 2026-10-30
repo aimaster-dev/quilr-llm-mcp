@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import unicodedata
 from typing import Any
 
 import pytest
@@ -32,7 +33,7 @@ def call(name: Any, **params: Any) -> Any:
     return message(params={"name": name, "arguments": {}, **params})
 
 
-# --- admin tool detection -----------------------------------------------------------------------
+# --- admin tool detection (the normalisation layer, on any string) -----------------------------
 
 ADMIN_VARIANTS = [
     "admin_reset_key",
@@ -86,10 +87,121 @@ def test_any_spelling_of_the_admin_prefix_is_an_admin_tool(
 
 
 @settings(max_examples=300, deadline=None)
-@given(st.from_regex(r"[A-Za-z0-9._-]{1,64}", fullmatch=True))
+@given(st.from_regex(r"[A-Za-z0-9._-]{1,128}", fullmatch=True))
 def test_spec_conformant_names_are_admin_tools_iff_they_start_with_admin_(name: str) -> None:
     # SEP-986 tool names: for these the check is a plain case-insensitive prefix test.
     assert is_admin_tool(name) == name.lower().startswith("admin_")
+
+
+# --- the MCP tool-name grammar (first layer) ----------------------------------------------------
+
+# Names that a loose downstream could read as an admin tool, but that the NFKC/casefold layer alone
+# does not fold to `admin_` (the audit's findings), plus the variants that layer did catch.
+UNICODE_LOOKALIKES = [
+    "adm\u0131n_reset_key",  # dotless i: "adm\u0131n_reset_key".upper() == "ADMIN_RESET_KEY"
+    "adm\u0130n_reset_key",  # capital I with dot above: .lower() is "admi\u0307n_..."
+    "\u00e0dmin_reset_key",  # precomposed a with grave: ASCII-folds to "admin_"
+    "a\u0300dmin_reset_key",  # a + combining grave
+    "admi\u0301n_reset_key",  # combining acute inside the prefix
+    "admin\u0301_reset_key",  # combining acute after the prefix
+    "\u0430dmin_reset_key",  # Cyrillic a (homoglyph)
+    "admin_reset_\u212aey",  # Kelvin sign, lower-cases to "k"
+    "admin_re\u017fet_key",  # long s, upper-cases to "S"
+    "\uff41\uff44\uff4d\uff49\uff4e_reset_key",  # full-width letters
+    "admin\uff3freset_key",  # full-width low line
+    "\u200badmin_reset_key",  # zero-width space
+    "\ufeffadmin_reset_key",  # byte-order mark
+    "adm\u00adin_reset_key",  # soft hyphen
+    " admin_reset_key",
+    "admin_reset_key ",
+    "\tadmin_reset_key\n",
+    "\u00a0admin_x",  # no-break space
+    "admin_reset_key\x00",
+    "get weather",
+    "get_weather/../admin_reset_key",
+    "x" * 129,
+    "admin_" + "x" * 123,
+]
+
+
+@pytest.mark.parametrize("role", list(Role))
+@pytest.mark.parametrize("name", UNICODE_LOOKALIKES)
+def test_names_outside_the_tool_name_grammar_are_invalid_params(name: str, role: Role) -> None:
+    with pytest.raises(JsonRpcError) as exc:
+        authorize(call(name), role)
+    assert exc.value.code == INVALID_PARAMS
+    assert exc.value.rpc_id == 1
+    assert name not in exc.value.message  # the client input is not echoed
+
+
+@pytest.mark.parametrize(
+    ("name", "admin_tool"),
+    [
+        ("get_weather", False),
+        ("get-weather.v2", False),
+        ("Z", False),
+        ("x" * 128, False),
+        ("admin_" + "x" * 122, True),
+        ("Admin_reset_key", True),
+        ("ADMIN_RESET_KEY", True),
+        ("aDmIn_x", True),
+        ("admin-reset-key", False),
+        ("admin.reset_key", False),
+    ],
+)
+def test_names_in_the_grammar_are_accepted_and_gated_case_insensitively(name: str, admin_tool: bool) -> None:
+    assert authorize(call(name), Role.ADMIN).allowed
+    viewer = authorize(call(name), Role.VIEWER)
+    assert viewer.allowed is not admin_tool
+    assert viewer.tool == name
+
+
+def _ascii_fold(name: str) -> str:
+    return unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()
+
+
+_LOOKALIKE_CHARACTERS = ["\u0131", "\u0130", "\u017f", "\u212a", "\u0300", "\u00e0", "\u0430", "\uff41"]
+_TRICKY = st.sampled_from([*"adminADMIN_.-x0 \t", *_LOOKALIKE_CHARACTERS, "\u200b", "\u00a0"])
+
+
+@settings(max_examples=500, deadline=None)
+@given(st.one_of(st.text(_TRICKY, min_size=1, max_size=12), st.text(max_size=140)))
+def test_every_accepted_tool_name_has_a_single_ascii_reading(name: str) -> None:
+    try:
+        decision = authorize(call(name), Role.VIEWER)
+    except JsonRpcError as exc:
+        assert exc.code == INVALID_PARAMS
+        return
+    # Accepted: the case-insensitive, Unicode-folding and ASCII-folding readings a downstream could
+    # give the name all agree, so the gateway's prefix check means the same thing as theirs.
+    assert name.isascii()
+    readings = {
+        name.lower(),
+        name.casefold(),
+        name.upper().lower(),
+        normalize_identifier(name),
+        _ascii_fold(name).lower(),
+    }
+    assert len(readings) == 1
+    assert decision.allowed is not readings.pop().startswith("admin_")
+
+
+@settings(max_examples=300, deadline=None)
+@given(
+    prefix=st.lists(_INVISIBLE, max_size=4).map("".join),
+    upper=st.lists(st.booleans(), min_size=6, max_size=6),
+    suffix=st.text(max_size=20),
+)
+def test_no_spelling_of_the_admin_prefix_is_allowed_for_a_viewer(
+    prefix: str, upper: list[bool], suffix: str
+) -> None:
+    spelled = "".join(ch.upper() if up else ch for ch, up in zip("admin_", upper, strict=True))
+    try:
+        decision = authorize(call(prefix + spelled + suffix), Role.VIEWER)
+    except JsonRpcError as exc:
+        assert exc.code == INVALID_PARAMS  # outside the grammar
+    else:
+        assert not decision.allowed
 
 
 # --- authorize ----------------------------------------------------------------------------------
@@ -114,7 +226,7 @@ def test_everything_but_admin_tool_calls_is_allowed_for_every_role(msg: Any, rol
     assert authorize(msg, role).allowed
 
 
-@pytest.mark.parametrize("name", ["admin_reset_key", "Admin_reset_key", " admin_delete_user"])
+@pytest.mark.parametrize("name", ["admin_reset_key", "Admin_reset_key", "ADMIN_DELETE_USER"])
 def test_admin_tools_are_denied_to_viewers(name: str) -> None:
     decision = authorize(call(name), Role.VIEWER)
     assert not decision.allowed

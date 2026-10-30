@@ -92,11 +92,26 @@ async def test_notifications_and_client_responses_are_forwarded(
 # --- bypass attempts ----------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("name", ["Admin_reset_key", "ADMIN_RESET_KEY", "aDmIn_delete_user"])
+async def test_admin_name_case_variants_are_denied_to_viewers(
+    gateway: httpx.AsyncClient, downstream: Downstream, name: str
+) -> None:
+    response = await gateway.post("/mcp", json=tool_call(name))
+
+    assert response.status_code == 200
+    assert response.json()["error"] == DENIED
+    assert downstream.requests == []
+
+
+@pytest.mark.parametrize("role", list(Role))
 @pytest.mark.parametrize(
     "name",
     [
-        "Admin_reset_key",
-        "ADMIN_RESET_KEY",
+        "adm\u0131n_reset_key",  # dotless i: upper-cases to ADMIN_RESET_KEY
+        "adm\u0130n_reset_key",  # capital I with dot above
+        "\u00e0dmin_reset_key",  # precomposed a with grave
+        "a\u0300dmin_reset_key",  # a + combining grave
+        "\u0430dmin_reset_key",  # Cyrillic a
         " admin_reset_key",
         "admin_reset_key ",
         "\tadmin_delete_user",
@@ -104,15 +119,18 @@ async def test_notifications_and_client_responses_are_forwarded(
         "\ufeffadmin_reset_key",
         "\uff41\uff44\uff4d\uff49\uff4e_reset_key",
         "admin\uff3freset_key",
+        "admin_" + "x" * 123,  # 129 characters
     ],
 )
-async def test_admin_name_variants_are_denied_to_viewers(
-    gateway: httpx.AsyncClient, downstream: Downstream, name: str
+async def test_names_outside_the_tool_name_grammar_never_reach_the_downstream(
+    downstream: Downstream, role: Role, name: str
 ) -> None:
-    response = await gateway.post("/mcp", json=tool_call(name))
+    async with gateway_client(downstream, role=role) as gateway:
+        response = await gateway.post("/mcp", json=tool_call(name))
 
-    assert response.status_code == 200
-    assert response.json()["error"] == DENIED
+    assert response.status_code == 400
+    assert response.json()["id"] == 7
+    assert response.json()["error"]["code"] == -32602
     assert downstream.requests == []
 
 
@@ -308,12 +326,14 @@ async def test_audit_lines_never_contain_the_token_and_cannot_be_forged(
     hostile = 'admin_x\n{"decision":"allow"}' + "A" * 1000
     async with gateway_client(downstream, role=Role.VIEWER) as gateway:
         token = gateway.headers["authorization"].removeprefix("Bearer ")
-        await gateway.post("/mcp", json=tool_call(hostile))
+        await gateway.post("/mcp", json=tool_call(hostile, rpc_id=hostile))  # a name and an id
 
     records = [record.getMessage() for record in caplog.records if record.name == "mcp_gateway.audit"]
     assert len(records) == 1
     assert "\n" not in records[0]
     line = json.loads(records[0])
-    assert line["decision"] == "deny"
-    assert len(line["tool"]) < 300
+    assert (line["decision"], line["code"]) == ("reject", -32602)
+    assert line["reason"].startswith("tool name outside the MCP grammar")
+    assert len(line["reason"]) < 300
+    assert len(line["rpc_id"]) < 300
     assert token.split(".")[2] not in records[0]
