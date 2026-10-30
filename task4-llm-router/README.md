@@ -90,7 +90,10 @@ warning when `--workers` is above 1 on Windows. Use one worker on Windows; scale
 ### Configuration
 
 Every flag also reads an `LLM_ROUTER_*` environment variable (`--primary-timeout-ms` ->
-`LLM_ROUTER_PRIMARY_TIMEOUT_MS`); flags win.
+`LLM_ROUTER_PRIMARY_TIMEOUT_MS`); flags win. Invalid values, from a flag or the environment, are a
+usage error (exit 2) with a one-line message: durations must be finite (`nan` would otherwise
+disable the 3000 ms deadline) and `--log-level` is one of `DEBUG`, `INFO`, `WARNING`, `ERROR`,
+`CRITICAL` (any case).
 
 | Flag | Default | Notes |
 |------|---------|-------|
@@ -120,11 +123,25 @@ Every flag also reads an `LLM_ROUTER_*` environment variable (`--primary-timeout
 ## API
 
 `POST /v1/chat/completions` with `Authorization: Bearer <tenant-key>` and a strict subset of the
-OpenAI body: `messages` (roles `system`/`developer`/`user`/`assistant`, string or text-part
-content), `model`, `max_tokens` (1-32768), `temperature`, `top_p`, `stop`. Unknown fields are
-rejected rather than forwarded. `stream: true` gets `400 streaming_not_supported`: failover is only
-clean before the first byte reaches the client, and a non-streaming endpoint keeps that guarantee
-simple. `model` is echoed back; the gateway decides which provider models serve the request.
+OpenAI body:
+
+- `messages`: roles `system`/`developer`/`user`/`assistant`/`tool`, string or text-part content,
+  optional `name`. Chat histories with tool calls work: an assistant message may carry `tool_calls`
+  (and then `content: null`), and a `tool` message needs its `tool_call_id`. Tool calls count
+  towards the prompt estimate.
+- `max_tokens` or its newer OpenAI name `max_completion_tokens` (1-32768; both are accepted if they
+  agree). Either way it is charged and forwarded as `max_tokens`.
+- `temperature`, `top_p`, `presence_penalty`, `frequency_penalty`, `seed`, `stop`, `user`:
+  validated and forwarded.
+- `n` is accepted only as `1` (`n > 1` gets a 400 that says so); `model` is echoed back, and the
+  gateway decides which provider models serve the request.
+
+Anything else (`tools`, `logit_bias`, `response_format`, ...) is rejected with
+`400 invalid_request` naming the field ("is not supported by this gateway") rather than forwarded.
+`stream: true` gets `400 streaming_not_supported`: failover is only clean before the first byte
+reaches the client, and a non-streaming endpoint keeps that guarantee simple. Validation messages
+name fields by their JSON path (`messages.0.content`), never by pydantic internals, and never echo
+values.
 
 | Response header | Meaning |
 |-----------------|---------|
@@ -314,7 +331,7 @@ last attempt, and every attempt is logged.
 | 400 | `invalid_request_error` | `streaming_not_supported` | `stream: true` |
 | 400 | `invalid_request_error` | `upstream_rejected_request` | provider returned 400/413/422 |
 | 401 | `authentication_error` | `invalid_api_key` | missing, malformed or unknown Bearer key (`WWW-Authenticate: Bearer`) |
-| 404 / 405 | `not_found_error` / `invalid_request_error` | `not_found` / `method_not_allowed` | routing |
+| 404 / 405 | `not_found_error` / `invalid_request_error` | `not_found` / `method_not_allowed` | routing (no trailing-slash redirects: `/v1/chat/completions/` is a 404) |
 | 413 | `invalid_request_error` | `request_too_large` / `payload_too_large` | cost above the whole window / body too big |
 | 429 | `rate_limit_error` | `tenant_token_limit_exceeded` | window full; `Retry-After` set |
 | 502 | `upstream_error` | `upstream_bad_response` | malformed or oversized provider response, provider 401/403/404 |
@@ -328,6 +345,10 @@ last attempt, and every attempt is logged.
 - A pure ASGI middleware assigns a server-generated request id (client-supplied ids are ignored, as
   they could collide or inject text into logs), sets `X-Request-Id` on every response, and turns any
   unhandled exception into the generic 500. Starlette's 404/405 are mapped onto the same payload.
+- A client that hangs up before sending its whole body is logged at INFO and gets nothing: no
+  ERROR line, no 500 written to a closed socket.
+- No `server: uvicorn` header (`server_header=False`), and no trailing-slash redirects (an empty
+  307 is not the standard shape).
 - Full details go only to the logs: upstream status, a bounded and escaped body snippet (escaping
   stops a provider from forging log lines), tracebacks. The request id is stored in a context
   variable, which follows the request into worker threads and appears on every log line.
@@ -377,8 +398,9 @@ pytest          # about 180 tests, ~20 s; deadlines are shortened to 250-300 ms 
 | `test_limiter.py` | window sliding and boundaries, per-tenant and sweeper eviction, exact Retry-After, reconcile (incl. over limit, out-of-range counts refused), release, restart persistence, raw key absent from DB/WAL bytes, 8 threads and 4 processes on separate connections admitting exactly `floor(limit/cost)`, 12 connections creating a fresh database at once, a locked database failing fast (bounded timing) and recovering, a Hypothesis property checking every decision and Retry-After against the definition of the window |
 | `test_main.py` | the database is created before any worker starts, an unusable path is a clean start-up error, the Windows multi-worker warning |
 | `test_router.py` | 429/timeout/connect/5xx/malformed/oversized failover, refusals (401/403/404/408/...) fail over unless disabled, 400/413/422 not retried, policy switches, slow-drip body, real-socket checks that the timed-out primary sees the connection close, that a pooled connection closed by the provider is retried once and that a fresh connection or a started response is never resent, keep-alive expiry, upstream `Retry-After` relayed, late primary cancelled and never used, outer cancellation, 80 concurrent mixed requests |
-| `test_errors.py` | catalogue, catch-all 500, routing errors, secrets/hostnames/tracebacks/provider and model names never in responses but present in logs with the same request id, Hypothesis property over random secrets |
-| `test_api.py` | auth, headers, reconcile and release accounting (plausible usage recorded exactly; `2**63`, `10**15`, `0`, negative, malformed and missing usage keep the reservation and still serve; a failing reconcile still returns the completion), timeout race bounded by the deadline with only the fallback counted, client disconnect (receive channel only, no cancellation) and outer cancellation both release, exact Retry-After with an injected clock, validation without echoing input, 40 parallel requests admit exactly `floor(limit/cost)`, two app instances sharing one budget |
+| `test_settings.py` | defaults, flag/env precedence, `nan`/`inf` and bad log levels rejected cleanly, the multi-worker environment round trip |
+| `test_errors.py` | catalogue, catch-all 500, routing errors, upstream `Retry-After` sanitizing, secrets/hostnames/tracebacks/provider and model names never in responses but present in logs with the same request id, Hypothesis property over random secrets |
+| `test_api.py` | auth, headers, reconcile and release accounting (plausible usage recorded exactly; `2**63`, `10**15`, `0`, negative, malformed and missing usage keep the reservation and still serve; a failing reconcile still returns the completion), timeout race bounded by the deadline with only the fallback counted, client disconnect (receive channel only, no cancellation) and outer cancellation both release, exact Retry-After with an injected clock, validation without echoing input or pydantic internals, OpenAI SDK fields (`max_completion_tokens`, `n: 1`, `user`, penalties, `seed`, tool-call histories), a client hanging up mid-body gets no 500, trailing-slash 404, 40 parallel requests admit exactly `floor(limit/cost)`, two app instances sharing one budget |
 | `test_e2e.py` | uvicorn on ephemeral ports: slow and drip primaries fail over at the deadline and see the gateway hang up; a client that gives up after 0.5 s gets its primary attempt cancelled before the deadline, usage 0 and no secondary call; full failover / 503 / 429 walkthrough |
 
 ## Limitations and trade-offs

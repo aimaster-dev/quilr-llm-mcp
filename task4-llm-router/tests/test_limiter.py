@@ -41,7 +41,14 @@ def test_defaults_match_the_spec(make_limiter) -> None:
 
 @pytest.mark.parametrize(
     "kwargs",
-    [{"limit_tokens": 0}, {"limit_tokens": 2**40 + 1}, {"window_seconds": 0}, {"busy_timeout_ms": -1}],
+    [
+        {"limit_tokens": 0},
+        {"limit_tokens": 2**40 + 1},
+        {"window_seconds": 0},
+        {"window_seconds": float("nan")},
+        {"window_seconds": float("inf")},
+        {"busy_timeout_ms": -1},
+    ],
 )
 def test_rejects_invalid_configuration(make_limiter, kwargs) -> None:
     with pytest.raises(ValueError):

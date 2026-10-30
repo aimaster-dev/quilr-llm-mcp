@@ -35,7 +35,9 @@ async def serve(app: Starlette) -> AsyncIterator[str]:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
-    config = uvicorn.Config(app, log_config=None, log_level="warning", timeout_graceful_shutdown=2)
+    config = uvicorn.Config(
+        app, log_config=None, log_level="warning", timeout_graceful_shutdown=2, server_header=False
+    )
     server = uvicorn.Server(config)
     try:
         async with anyio.create_task_group() as tg:
@@ -146,6 +148,10 @@ async def test_walkthrough_failover_errors_and_rate_limits(tmp_path: Path) -> No
 
         ok = await client.post("/v1/chat/completions", json=chat_body(), headers=auth())
         assert ok.status_code == 200 and ok.headers["x-gateway-route"] == "primary"
+        assert "server" not in ok.headers  # no "server: uvicorn"
+
+        slash = await client.post("/v1/chat/completions/", json=chat_body(), headers=auth())
+        assert slash.status_code == 404 and slash.json()["error"]["code"] == "not_found"
 
         await client.put(f"{primary_url}/_mock/mode", json={"mode": "429"})
         failover = await client.post("/v1/chat/completions", json=chat_body(), headers=auth())

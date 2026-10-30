@@ -15,6 +15,7 @@ A request's cost is ``prompt_estimate + max_tokens``: the provider can never gen
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Iterable, Mapping
 from typing import Any
@@ -46,14 +47,22 @@ def _content_text(content: Any) -> str:
 
 
 def estimate_prompt_tokens(messages: Iterable[Mapping[str, Any]]) -> int:
-    """Estimate the prompt tokens of a list of chat messages."""
+    """Estimate the prompt tokens of a list of chat messages.
+
+    Tool calls in the history are counted as their JSON text (ids, function names, arguments),
+    which a provider also has to tokenize.
+    """
     total = REPLY_PRIMING_TOKENS
     for message in messages:
         total += MESSAGE_OVERHEAD_TOKENS
         total += estimate_text_tokens(_content_text(message.get("content")))
-        name = message.get("name")
-        if isinstance(name, str):
-            total += estimate_text_tokens(name)
+        for key in ("name", "tool_call_id"):
+            value = message.get(key)
+            if isinstance(value, str):
+                total += estimate_text_tokens(value)
+        tool_calls = message.get("tool_calls")
+        if tool_calls:
+            total += estimate_text_tokens(json.dumps(tool_calls, ensure_ascii=False, separators=(",", ":")))
     return total
 
 

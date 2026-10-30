@@ -17,7 +17,7 @@ from http import HTTPStatus
 from starlette.datastructures import MutableHeaders
 from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
-from starlette.requests import Request
+from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -49,7 +49,11 @@ def error_response(error: GatewayError, request_id: str) -> JSONResponse:
 
 
 class RequestContextMiddleware:
-    """Assigns the request id and turns any unhandled exception into a generic 500 payload."""
+    """Assigns the request id and turns any unhandled exception into a generic 500 payload.
+
+    A client that disconnects mid-body (Starlette's ``ClientDisconnect``) is logged at INFO and
+    gets no response at all, rather than an ERROR line and a 500 written to a closed socket.
+    """
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
@@ -73,6 +77,14 @@ class RequestContextMiddleware:
 
         try:
             await self.app(scope, receive, send_with_request_id)
+        except ClientDisconnect:
+            # The client hung up before sending the whole body. That is not a server error, and
+            # there is nobody left to send a response to.
+            logger.info(
+                "client disconnected before sending the whole request body: %s %s",
+                scope.get("method"),
+                scope.get("path"),
+            )
         except Exception:
             # The traceback goes to the logs only; the client gets a fixed message and the id.
             logger.exception("unhandled error serving %s %s", scope.get("method"), scope.get("path"))

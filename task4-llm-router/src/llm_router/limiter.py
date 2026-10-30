@@ -147,8 +147,8 @@ class TokenRateLimiter:
     ) -> None:
         if not 1 <= limit_tokens <= MAX_ROW_TOKENS:
             raise ValueError(f"limit_tokens must be between 1 and {MAX_ROW_TOKENS}")
-        if window_seconds <= 0:
-            raise ValueError("window_seconds must be positive")
+        if not (math.isfinite(window_seconds) and window_seconds > 0):
+            raise ValueError("window_seconds must be a positive, finite number")
         if busy_timeout_ms < 0:
             raise ValueError("busy_timeout_ms must not be negative")
         self.db_path = Path(db_path)

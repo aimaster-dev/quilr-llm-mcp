@@ -110,8 +110,9 @@ class Upstream:
     api_key: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
-        if self.timeout <= 0:
-            raise ValueError(f"{self.label} timeout must be positive")
+        # A nan or infinite deadline would silently never fire (move_on_after(nan) waits forever).
+        if not (math.isfinite(self.timeout) and self.timeout > 0):
+            raise ValueError(f"{self.label} timeout must be a positive, finite number of seconds")
 
     @property
     def completions_url(self) -> str:

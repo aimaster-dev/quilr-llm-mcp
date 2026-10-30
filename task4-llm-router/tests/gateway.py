@@ -61,12 +61,14 @@ class Harness:
     def gateway(self) -> Gateway:
         return self.app.state.gateway
 
-    async def chat(self, key: str | None = KEY_A, body: Any = None, **kwargs: Any) -> httpx.Response:
+    async def chat(
+        self, key: str | None = KEY_A, body: Any = None, url: str = "/v1/chat/completions", **kwargs: Any
+    ) -> httpx.Response:
         headers = kwargs.pop("headers", {})
         if key is not None:
             headers["Authorization"] = f"Bearer {key}"
         return await self.client.post(
-            "/v1/chat/completions", json=chat_body() if body is None else body, headers=headers, **kwargs
+            url, json=chat_body() if body is None else body, headers=headers, **kwargs
         )
 
     async def usage(self, key: str = KEY_A) -> int:

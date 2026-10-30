@@ -65,9 +65,16 @@ def main(argv: Sequence[str] | None = None) -> None:
             port=settings.port,
             workers=settings.workers,
             log_config=None,
+            server_header=False,
         )
     else:
-        uvicorn.run(create_app(settings), host=settings.host, port=settings.port, log_config=None)
+        uvicorn.run(
+            create_app(settings),
+            host=settings.host,
+            port=settings.port,
+            log_config=None,
+            server_header=False,  # no "server: uvicorn": it only advertises the stack
+        )
 
 
 if __name__ == "__main__":

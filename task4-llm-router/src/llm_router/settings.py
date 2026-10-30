@@ -7,6 +7,7 @@ tenant keys) are read from the environment only, so they never appear in process
 from __future__ import annotations
 
 import argparse
+import math
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -33,6 +34,7 @@ from llm_router.schemas import MAX_TOKENS_LIMIT
 ENV_PREFIX = "LLM_ROUTER_"
 PRIMARY_LABEL = "primary"
 SECONDARY_LABEL = "fallback"
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
 
 @dataclass(frozen=True)
@@ -71,12 +73,18 @@ class Settings:
             raise ValueError("a primary upstream URL and model are required")
         if bool(self.secondary_url) != bool(self.secondary_model):
             raise ValueError("set both the secondary upstream URL and model, or neither")
+        # math.isfinite: nan compares false with everything, so "nan <= 0" would let it through
+        # (and move_on_after(nan) never fires: the 3000 ms deadline would silently disappear).
         for name in ("primary_timeout", "secondary_timeout", "window_seconds", "sweep_interval"):
-            if getattr(self, name) <= 0:
-                raise ValueError(f"{name} must be positive")
+            value = getattr(self, name)
+            if not (math.isfinite(value) and value > 0):
+                raise ValueError(f"{name} must be a positive, finite number")
         for name in ("db_busy_timeout", "db_fail_fast"):
-            if getattr(self, name) < 0:
-                raise ValueError(f"{name} must not be negative")
+            value = getattr(self, name)
+            if not (math.isfinite(value) and value >= 0):
+                raise ValueError(f"{name} must be a finite number, not negative")
+        if self.log_level not in LOG_LEVELS:
+            raise ValueError(f"log_level must be one of {', '.join(LOG_LEVELS)}")
         if self.tokens_per_window < 1:
             raise ValueError("tokens_per_window must be at least 1")
         if not 1 <= self.default_max_tokens <= MAX_TOKENS_LIMIT:
@@ -159,6 +167,7 @@ class _Option:
     help: str
     to_env: Callable[[Any], str] = str
     boolean: bool = False
+    choices: tuple[str, ...] | None = None
 
     @property
     def env(self) -> str:
@@ -247,7 +256,13 @@ _OPTIONS = (
         int,
         "largest provider response body read; bigger is a bad response (default 4 MiB)",
     ),
-    _Option("--log-level", "log_level", str, "DEBUG, INFO, WARNING or ERROR (default INFO)"),
+    _Option(
+        "--log-level",
+        "log_level",
+        lambda value: value.strip().upper(),
+        f"one of {', '.join(LOG_LEVELS)}, case-insensitive (default INFO)",
+        choices=LOG_LEVELS,
+    ),
 )
 
 
@@ -271,7 +286,12 @@ def build_parser(prog: str = "llm-router") -> argparse.ArgumentParser:
         else:
             metavar = option.flag.removeprefix("--").replace("-", "_").upper()
             parser.add_argument(
-                option.flag, dest=option.attr, type=option.parse, metavar=metavar, help=help_text
+                option.flag,
+                dest=option.attr,
+                type=option.parse,
+                choices=option.choices,
+                metavar=metavar,
+                help=help_text,
             )
     return parser
 
@@ -292,6 +312,11 @@ def load_settings(argv: Sequence[str] | None, environ: Mapping[str, str]) -> Set
                 value = option.parse(environ[option.env])
             except (ValueError, argparse.ArgumentTypeError) as exc:
                 parser.error(f"{option.env}: {exc}")
+            if option.choices and value not in option.choices:
+                parser.error(
+                    f"{option.env}: invalid choice {environ[option.env]!r} "
+                    f"(choose from {', '.join(option.choices)})"
+                )
         if value is not None:
             values[option.attr] = value
 

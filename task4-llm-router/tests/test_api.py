@@ -12,6 +12,7 @@ import httpx
 import pytest
 
 from llm_router.keys import fingerprint_api_key
+from llm_router.tokens import estimate_prompt_tokens
 from tests.gateway import COST, KEY_A, KEY_B, PROMPT, chat_body, make_settings, running_gateway
 from tests.helpers import FakeClock
 from tests.upstreams import Recorder, completion_body, ok, respond
@@ -425,6 +426,7 @@ async def test_raw_tenant_keys_never_reach_the_database(tmp_path: Path) -> None:
 # -- validation ----------------------------------------------------------------------------------
 
 SECRET_INPUT = "SECRET-INPUT-VALUE-4242"
+TOOL_CALL = {"id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": '{"q":"x"}'}}
 
 
 @pytest.mark.parametrize(
@@ -435,12 +437,25 @@ SECRET_INPUT = "SECRET-INPUT-VALUE-4242"
         ({"model": "m"}, "invalid_request", "messages"),
         ({"messages": []}, "invalid_request", "messages"),
         ({"messages": SECRET_INPUT}, "invalid_request", "messages"),
-        ({**chat_body(), "frequency_penalty": 1}, "invalid_request", "frequency_penalty"),
+        ({**chat_body(), "logit_bias": {"42": 1}}, "invalid_request", "logit_bias: is not supported"),
+        ({**chat_body(), "tools": []}, "invalid_request", "tools: is not supported"),
         ({**chat_body(), "max_tokens": 0}, "invalid_request", "max_tokens"),
         ({**chat_body(), "max_tokens": "100"}, "invalid_request", "max_tokens"),
+        ({**chat_body(), "max_completion_tokens": 40_000}, "invalid_request", "max_completion_tokens"),
+        ({**chat_body(), "max_completion_tokens": 50}, "invalid_request", "max_completion_tokens disagree"),
+        ({**chat_body(), "n": 2}, "invalid_request", "n > 1 is not supported"),
         ({**chat_body(), "temperature": 5}, "invalid_request", "temperature"),
-        ({"messages": [{"role": "tool", "content": SECRET_INPUT}]}, "invalid_request", "role"),
-        ({"messages": [{"role": "user", "content": 42}]}, "invalid_request", "content"),
+        ({**chat_body(), "presence_penalty": 3}, "invalid_request", "presence_penalty"),
+        ({"messages": [{"role": "robot", "content": SECRET_INPUT}]}, "invalid_request", "role"),
+        ({"messages": [{"role": "user", "content": 42}]}, "invalid_request", "messages.0.content:"),
+        ({"messages": [{"role": "user", "content": None}]}, "invalid_request", "content is required"),
+        ({"messages": [{"role": "user"}]}, "invalid_request", "content is required"),
+        ({"messages": [{"role": "tool", "content": SECRET_INPUT}]}, "invalid_request", "tool_call_id"),
+        (
+            {"messages": [{"role": "user", "content": "x", "tool_calls": [TOOL_CALL]}]},
+            "invalid_request",
+            "only assistant messages can have tool_calls",
+        ),
         ({**chat_body(), "stream": True}, "streaming_not_supported", "stream"),
     ],
 )
@@ -467,6 +482,119 @@ async def test_invalid_requests_are_rejected_without_echoing_input(
     assert usage == 0
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param({"messages": [{"role": "user", "content": 42}]}, id="content-type"),
+        pytest.param({"messages": [{"role": "user", "content": [{"type": "image"}]}]}, id="content-part"),
+        pytest.param({**chat_body(), "stop": 5}, id="stop"),
+    ],
+)
+async def test_validation_errors_name_fields_not_pydantic_internals(tmp_path: Path, body: dict) -> None:
+    async with running_gateway(make_settings(tmp_path), Recorder(ok())) as gw:
+        response = await gw.chat(body=body)
+    message = error_of(response)["message"]
+    for internal in ("listTextPart", "list[", "TextPart", ".str:", "liststr", "Value error"):
+        assert internal not in message
+    assert message.startswith("Invalid request body: ")
+
+
+async def test_openai_sdk_fields_are_accepted_and_forwarded(tmp_path: Path) -> None:
+    primary = Recorder(ok(total_tokens=COST))
+    body = chat_body(
+        max_tokens=None,
+        max_completion_tokens=83,  # the current OpenAI name: charged like max_tokens
+        n=1,
+        user="end-user-17",
+        top_p=0.9,
+        presence_penalty=0.5,
+        frequency_penalty=-0.5,
+        seed=1234,
+    )
+    async with running_gateway(make_settings(tmp_path), primary) as gw:
+        response = await gw.chat(body=body)
+        charged = await gw.usage()
+
+    assert response.status_code == 200
+    sent = primary.json()
+    assert sent["max_tokens"] == 83 and "max_completion_tokens" not in sent
+    assert "n" not in sent
+    for field in ("user", "top_p", "presence_penalty", "frequency_penalty", "seed"):
+        assert sent[field] == body[field]
+    assert charged == COST
+
+
+async def test_max_tokens_and_max_completion_tokens_may_agree(tmp_path: Path) -> None:
+    primary = Recorder(ok(total_tokens=COST))
+    async with running_gateway(make_settings(tmp_path), primary) as gw:
+        response = await gw.chat(body=chat_body(max_completion_tokens=COST - 17))
+    assert response.status_code == 200
+    assert primary.json()["max_tokens"] == COST - 17
+
+
+async def test_tool_call_histories_are_accepted_and_counted(tmp_path: Path) -> None:
+    primary = Recorder(ok(total_tokens=None))
+    messages = [
+        {"role": "user", "content": "What is x?"},
+        {"role": "assistant", "content": None, "tool_calls": [TOOL_CALL]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "x is 42"},
+    ]
+    async with running_gateway(make_settings(tmp_path), primary) as gw:
+        response = await gw.chat(body={"messages": messages, "max_tokens": 10})
+        charged = await gw.usage()
+
+    assert response.status_code == 200
+    forwarded = primary.json()["messages"]
+    assert forwarded == [
+        {"role": "user", "content": "What is x?"},
+        {"role": "assistant", "tool_calls": [TOOL_CALL]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "x is 42"},
+    ]
+    # No usage reported, so the reservation stands: the tool call and its id are part of it.
+    assert charged == estimate_prompt_tokens(forwarded) + 10
+    without_tools = [{"role": m["role"], "content": m.get("content") or ""} for m in forwarded]
+    assert estimate_prompt_tokens(forwarded) > estimate_prompt_tokens(without_tools)
+
+
+async def test_a_client_that_hangs_up_mid_body_gets_no_500(tmp_path: Path, caplog) -> None:
+    caplog.set_level(logging.INFO)
+    primary = Recorder(ok())
+    async with running_gateway(make_settings(tmp_path), primary) as gw:
+        messages = [
+            {"type": "http.request", "body": b'{"messages":', "more_body": True},
+            {"type": "http.disconnect"},
+        ]
+        sent: list = []
+
+        async def receive() -> dict:
+            return messages.pop(0)
+
+        async def send(message: dict) -> None:
+            sent.append(message)
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/chat/completions",
+            "raw_path": b"/v1/chat/completions",
+            "root_path": "",
+            "query_string": b"",
+            "headers": [(b"authorization", f"Bearer {KEY_A}".encode()), (b"content-length", b"1000")],
+            "client": ("127.0.0.1", 50000),
+            "server": ("gateway.test", 80),
+        }
+        await gw.app(scope, receive, send)
+
+    assert sent == []  # nothing written to a closed connection
+    assert primary.requests == []
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    [record] = [r for r in caplog.records if "before sending the whole request body" in r.getMessage()]
+    assert record.levelno == logging.INFO
+
+
 async def test_oversized_bodies_are_rejected(tmp_path: Path) -> None:
     primary = Recorder(ok())
     async with running_gateway(make_settings(tmp_path, max_body_bytes=2048), primary) as gw:
@@ -482,9 +610,13 @@ async def test_other_routes_use_the_standard_error_shape(tmp_path: Path) -> None
         health = await gw.client.get("/healthz")
         missing = await gw.client.get("/v1/models")
         wrong_method = await gw.client.get("/v1/chat/completions")
+        trailing_slash = await gw.chat(url="/v1/chat/completions/")
     assert health.json() == {"status": "ok"}
     assert error_of(missing)["code"] == "not_found"
     assert error_of(wrong_method)["code"] == "method_not_allowed"
+    # Not an empty-bodied 307 redirect: the standard JSON 404.
+    assert trailing_slash.status_code == 404
+    assert error_of(trailing_slash)["code"] == "not_found"
 
 
 # -- concurrency ---------------------------------------------------------------------------------

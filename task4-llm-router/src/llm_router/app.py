@@ -175,7 +175,7 @@ async def chat_completions(request: Request) -> Response:
             code="streaming_not_supported",
         )
 
-    max_tokens = chat.max_tokens or settings.default_max_tokens
+    max_tokens = chat.completion_budget or settings.default_max_tokens
     prompt_tokens = estimate_prompt_tokens(chat.messages_payload())
     cost = request_cost(prompt_tokens, max_tokens)
 
@@ -327,7 +327,7 @@ def create_app(
         finally:
             limiter.close()
 
-    return Starlette(
+    app = Starlette(
         routes=[
             Route("/v1/chat/completions", chat_completions, methods=["POST"]),
             Route("/healthz", healthz, methods=["GET"]),
@@ -336,6 +336,10 @@ def create_app(
         exception_handlers=EXCEPTION_HANDLERS,
         lifespan=lifespan,
     )
+    # No redirect from "/v1/chat/completions/": an empty-bodied 307 is not the standard error shape,
+    # and clients would have to re-send the POST body. Unknown paths get the JSON 404 instead.
+    app.router.redirect_slashes = False
+    return app
 
 
 def create_app_from_env() -> Starlette:

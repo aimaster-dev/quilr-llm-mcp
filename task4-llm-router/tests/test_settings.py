@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import pytest
 
 from llm_router.keys import fingerprint_api_key
+from llm_router.router import Upstream
 from llm_router.settings import Settings, load_settings
 
 BASE_ENV = {
@@ -93,6 +95,42 @@ def test_invalid_configuration_is_a_usage_error(argv: list[str], env: dict[str, 
     assert excinfo.value.code == 2
 
 
+@pytest.mark.parametrize("value", ["nan", "inf", "NaN", "Infinity"])
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--primary-timeout-ms",  # nan would silently disable the 3000 ms deadline
+        "--secondary-timeout-ms",
+        "--window-seconds",  # nan/inf turned every 429 into a 500
+        "--sweep-interval",
+        "--db-busy-timeout-ms",
+        "--db-fail-fast-ms",
+    ],
+)
+def test_non_finite_numbers_are_rejected(flag: str, value: str) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        load_settings([flag, value], BASE_ENV)
+    assert excinfo.value.code == 2
+    env_name = "LLM_ROUTER_" + flag.removeprefix("--").replace("-", "_").upper()
+    with pytest.raises(SystemExit):
+        load_settings([], {**BASE_ENV, env_name: value})
+
+
+def test_log_level_is_validated_cleanly(capsys) -> None:
+    assert load_settings(["--log-level", "debug"], BASE_ENV).log_level == "DEBUG"
+    assert load_settings([], {**BASE_ENV, "LLM_ROUTER_LOG_LEVEL": "warning"}).log_level == "WARNING"
+    with pytest.raises(SystemExit) as flag_error:
+        load_settings(["--log-level", "LOUD"], BASE_ENV)
+    assert flag_error.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as env_error:
+        load_settings([], {**BASE_ENV, "LLM_ROUTER_LOG_LEVEL": "LOUD"})
+    assert env_error.value.code == 2
+    err = capsys.readouterr().err
+    assert "LLM_ROUTER_LOG_LEVEL: invalid choice 'LOUD'" in err
+    assert "Traceback" not in err
+
+
 def test_environment_round_trip_for_worker_processes(tmp_path: Path) -> None:
     env = {**BASE_ENV, "LLM_ROUTER_PRIMARY_API_KEY": "sk-p", "LLM_ROUTER_SECONDARY_API_KEY": "sk-s"}
     argv = [
@@ -129,3 +167,9 @@ def test_settings_validate_directly() -> None:
             tenant_key_fingerprints=frozenset({fingerprint_api_key("k")}),
             default_max_tokens=0,
         )
+
+
+@pytest.mark.parametrize("timeout", [math.nan, math.inf, 0, -1])
+def test_upstream_deadlines_must_be_finite(timeout: float) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        Upstream("primary", "http://a", "m", timeout)
