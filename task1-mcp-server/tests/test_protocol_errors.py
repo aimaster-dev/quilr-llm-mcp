@@ -127,6 +127,84 @@ def test_invalid_tool_arguments_report_fields_without_echoing_values(wire: Stdio
     assert secret not in json.dumps(response)
 
 
+def test_unexpected_argument_names_are_redacted_unless_identifiers(wire: StdioWireClient) -> None:
+    secret = "SSN 123-45-6789"
+    response = exchange(
+        wire, call(24, "get_customer_record", {"customer_id": "CUST-10001", secret: 1, "customerId": "x"})
+    )
+    errors = response["error"]["data"]["errors"]
+    # A typo is worth naming; a key that carries data is not echoed.
+    assert {(e["field"], e["type"]) for e in errors} == {
+        ("(redacted)", "extra_forbidden"),
+        ("customerId", "extra_forbidden"),
+    }
+    assert "123-45-6789" not in json.dumps(response)
+
+
+@pytest.mark.parametrize(
+    ("arguments_or_name", "field", "error_type"),
+    [
+        pytest.param({"arguments": "CUST-10001"}, "arguments", "dict_type", id="arguments-string"),
+        pytest.param({"arguments": ["CUST-10001"]}, "arguments", "dict_type", id="arguments-array"),
+        pytest.param({"name": 5}, "name", "string_type", id="name-not-string"),
+    ],
+)
+def test_malformed_tools_call_params_get_field_level_details(
+    wire: StdioWireClient, arguments_or_name: dict[str, Any], field: str, error_type: str
+) -> None:
+    # The SDK validates these before the tool registry sees them and answers with `data: ""`.
+    params = {"name": "get_customer_record", "arguments": {}, **arguments_or_name}
+    frame = json.dumps({"jsonrpc": "2.0", "id": 25, "method": "tools/call", "params": params}).encode()
+    error = exchange(wire, frame)["error"]
+    assert error["code"] == types.INVALID_PARAMS
+    assert {"field": field, "type": error_type} in [
+        {"field": e["field"], "type": e["type"]} for e in error["data"]["errors"]
+    ]
+    assert "CUST-10001" not in json.dumps(error)
+
+
+@pytest.mark.parametrize(
+    ("method", "echoed"),
+    [
+        pytest.param("no/such", True, id="plain-name"),
+        pytest.param("resources/list", True, id="spec-method-not-served"),
+        pytest.param("A" * 100_000, False, id="100kb-name"),
+        pytest.param("tools/call\u001b[31m", False, id="control-characters"),
+        pytest.param("SSN 123-45-6789", False, id="free-text"),
+    ],
+)
+def test_unknown_method_name_is_echoed_only_when_it_looks_like_one(
+    wire: StdioWireClient, method: str, echoed: bool
+) -> None:
+    response = exchange(wire, json.dumps({"jsonrpc": "2.0", "id": 26, "method": method}).encode())
+    error = response["error"]
+    assert error["code"] == types.METHOD_NOT_FOUND
+    assert error["message"] == "Method not found"
+    if echoed:
+        assert error["data"] == method
+    else:
+        assert "data" not in error
+    assert len(json.dumps(response)) < 300
+
+
+@pytest.mark.parametrize(
+    ("name", "echoed"),
+    [
+        pytest.param("delete_customer", True, id="plain-name"),
+        pytest.param("get_customer_record\u001b[31m", False, id="control-characters"),
+        pytest.param("T" * 129, False, id="too-long"),
+        pytest.param("SSN 123-45-6789", False, id="free-text"),
+    ],
+)
+def test_unknown_tool_name_is_echoed_only_when_it_looks_like_one(
+    wire: StdioWireClient, name: str, echoed: bool
+) -> None:
+    error = exchange(wire, call(27, name, {}))["error"]
+    assert error["code"] == types.INVALID_PARAMS
+    assert error["message"] == "Unknown tool"
+    assert error.get("data") == ({"tool": name} if echoed else None)
+
+
 def test_invalid_utf8_inside_a_string_is_rejected_not_replaced(wire: StdioWireClient) -> None:
     # Decoding with errors="replace" once issued this refund with reason "Damaged \ufffd\ufffd in transit".
     response = exchange(
@@ -158,7 +236,9 @@ def test_business_rule_failures_are_results_not_protocol_errors(wire: StdioWireC
     response = exchange(wire, call(21, "get_customer_record", {"customer_id": "CUST-99999"}))
     assert "error" not in response
     assert response["result"]["isError"] is True
-    assert response["result"]["structuredContent"]["error"]["code"] == "customer_not_found"
+    # No structuredContent (it would violate the outputSchema); the error is JSON in the text.
+    assert "structuredContent" not in response["result"]
+    assert json.loads(response["result"]["content"][0]["text"])["error"]["code"] == "customer_not_found"
 
 
 @pytest.mark.parametrize(

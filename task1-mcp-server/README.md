@@ -24,7 +24,7 @@ cancelled with `notifications/cancelled` are not waited for, since MCP forbids a
 | Tool | Arguments | Notes |
 |------|-----------|-------|
 | `get_customer_record` | `customer_id`: `CUST-` + exactly 5 digits | Read-only, idempotent |
-| `trigger_refund` | `customer_id`; `amount`: number, `0 < amount <= 1,000,000`, finite, max 2 decimals; `reason`: 10-500 chars after trimming | Destructive, not idempotent |
+| `trigger_refund` | `customer_id`; `amount`: number, `0 < amount <= 1,000,000`, finite, max 2 decimals; `reason`: 10-500 characters after trimming, no control or invisible format characters | Destructive, not idempotent |
 
 Seed customers: `CUST-10001` to `CUST-10003` are active, `CUST-10004` is suspended and `CUST-10005` is
 closed.
@@ -41,18 +41,77 @@ arguments **and** generate the JSON Schema published by `tools/list`.
   It is anchored so `"CUST-12345\n"` fails.
 - **Amount** must be finite (no `NaN`/`Infinity`), with at most 2 decimal places (`0.1 + 0.2` is
   rejected). Money is then handled as `Decimal`.
-- **Reason** is trimmed *before* the length check, so `"   damaged    "` cannot pass `min_length=10`.
-  Control characters (ANSI escapes, NUL) are rejected; newlines and tabs are allowed.
+- **Reason** is NFC-normalized, then trimmed, *then* length-checked, so `"   damaged    "` cannot
+  pass the 10-character minimum. Lengths count Unicode code points of that normalized, trimmed
+  value (an emoji is one, an `é` is one however it was encoded). Newlines and tabs are allowed.
+  Rejected:
+  - control characters (ANSI escapes, NUL, C1 controls);
+  - invisible format characters (Unicode category `Cf`): zero-width spaces and BOMs, which would
+    let a reason meet the minimum while showing nothing, bidi overrides and isolates, which make
+    stored text display differently from what it contains, and tag characters, which can hide text
+    from a human reviewer but not from a model. The exception is the zero-width joiner and
+    non-joiner (U+200D, U+200C): Persian and Indic scripts and emoji sequences (👨‍👩‍👧) need them.
+    They are allowed only between two visible characters, so they cannot pad a reason either.
+
+### Published schema vs. enforced rules
+
+`tools/list` states every rule JSON Schema can express, so a client that validates against the
+`inputSchema` is not surprised by the server:
+
+- `customer_id`: `pattern` `^CUST-[0-9]{5}$` plus `minLength`/`maxLength` 10 (redundant under
+  ECMA-262, but Python's `re`, used by the `jsonschema` package, lets `$` match before a trailing
+  newline);
+- `amount`: `type: number`, `exclusiveMinimum: 0`, `maximum: 1000000`;
+- `reason`: `minLength` 10, `maxLength` 500 and a `pattern` that rejects control and format
+  characters anywhere and whitespace at either end. The server trims edge whitespace rather than
+  rejecting it; the schema asks clients not to send it, so for any value the schema accepts,
+  trimming changes nothing and the lengths mean exactly what the server checks. The pattern uses
+  only `\uXXXX` escapes and character classes, which mean the same in ECMA-262 and Python's `re`.
+
+Enforced by the server only, because JSON Schema cannot say them:
+
+- **at most 2 decimal places** for `amount`. `multipleOf: 0.01` would be the obvious way, but
+  validators test it in binary floating point, where `0.07` is not a multiple of `0.01`, so they
+  would reject legitimate amounts;
+- **NFC normalization** before the `reason` length check (`minLength` counts the raw code points,
+  so the two differ only for text that is not already NFC);
+- **format characters outside the Basic Multilingual Plane** (tag characters U+E0000-E007F and a
+  few others): a JSON Schema pattern cannot name them portably, because ECMA-262 without the `u`
+  flag sees UTF-16 surrogate pairs;
+- **ZWJ/ZWNJ placement** (between two visible characters).
+
+`tests/test_schemas.py` checks this list against the `jsonschema` package: outside these rules the
+published schema and the server agree on every probe, and edge whitespace is the only input the
+schema rejects but the server accepts.
 
 ### Two kinds of errors
 
 | Failure | Reported as | Why |
 |---------|-------------|-----|
 | Unknown tool, malformed/missing/extra arguments | JSON-RPC error `-32602` *Invalid params*, field-level `data` | The request itself is invalid (protocol error) |
-| Unknown customer, refund above balance, inactive account | Successful response with `isError: true` and `structuredContent.error` | The request was valid. The model should see the failure and adapt (MCP *tool execution error*) |
+| Unknown customer, refund above balance, inactive account | Successful response with `isError: true`; the text content is `{"error":{"code":…,"message":…}}` | The request was valid. The model should see the failure and adapt (MCP *tool execution error*) |
+
+Error results carry **no `structuredContent`**. Each tool's `outputSchema` describes its successful
+result, and MCP says structured content MUST conform to it; a `{"error": …}` object would not, and
+a client such as the TypeScript SDK validates any structured content it receives. Advertising a
+`oneOf` of the record and an error shape would keep the check happy, but every consumer of a
+successful result would then have to handle a schema that might be an error. So the error is a
+machine-readable JSON document in the text content instead (codes: `customer_not_found`,
+`customer_not_active`, `exceeds_refundable_balance`), which is also what the model reads:
+
+```json
+{"jsonrpc":"2.0","id":8,"result":{"isError":true,"content":[{"type":"text",
+ "text":"{\"error\":{\"code\":\"customer_not_found\",\"message\":\"Customer CUST-99999 was not found\"}}"}]}}
+```
 
 Validation errors list `field`, `type` and a generic `message` per problem. They never echo the
-submitted values, which may contain PII or be arbitrarily large.
+submitted values, which may contain PII or be arbitrarily large. Names are echoed only when they
+look like names: an unexpected argument key is reported by name if it is an identifier (`customerId`,
+a likely typo) and as `(redacted)` otherwise (a key such as `SSN 123-45-6789`); an unknown tool name
+only if it uses MCP's tool-name characters and is at most 128 long; an unknown method name likewise
+(the SDK would echo it whole, 100 KB included). Malformed `tools/call` params that the SDK rejects
+before the tool is looked up (`arguments` that is not an object, a non-string `name`) get the same
+field-level `data`, where the SDK alone sends an empty string.
 
 ```json
 {"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"Invalid arguments for tool 'trigger_refund'",
