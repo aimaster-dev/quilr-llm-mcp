@@ -9,8 +9,11 @@ later with the provider's reported `usage`. The heuristic is deliberately simple
 * each chat message adds a fixed overhead for the role and separators, and the reply is primed
   with a few tokens, mirroring the OpenAI chat format.
 
-A request's cost is ``prompt_estimate + max_tokens``: the provider can never generate more than
-``max_tokens``, so the reservation is an upper bound unless the prompt estimate is too low.
+This is a typical-case estimate, not an upper bound: text denser than 4 bytes per token ("a a a",
+digits, base64, code, much CJK) is under-estimated, by at most 4x since no tokenizer emits more
+than one token per byte. A request's cost is ``prompt_estimate + max_tokens``: the provider can
+never generate more than ``max_tokens``, so the reservation bounds the completion exactly and the
+prompt typically. Reconciliation with the provider's ``usage`` corrects the difference.
 """
 
 from __future__ import annotations

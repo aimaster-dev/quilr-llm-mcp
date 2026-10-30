@@ -5,7 +5,9 @@ An OpenAI-compatible `POST /v1/chat/completions` gateway that:
 - limits each tenant API key to **50,000 tokens per rolling 60 s window**, with an exact
   sliding-window log stored in an **on-disk SQLite database** shared by all worker processes;
 - gives the primary model a hard **3000 ms** deadline and fails over to a secondary provider on a
-  primary **429** or **timeout** (and, configurably, on connection errors and 5xx);
+  primary **429** or **timeout** (and, configurably, on connection errors, 5xx and refusals such
+  as 401/403/404);
+- stops routing, and charges nothing, when the client hangs up;
 - returns every error in one sanitized shape that never leaks upstream bodies, stack traces,
   hostnames or provider names.
 
@@ -34,7 +36,10 @@ The mock reports the whole `max_tokens` budget as used, so each of these request
 
 ```bash
 REQ='{"model":"gpt-test","messages":[{"role":"user","content":"Hello"}],"max_tokens":500}'
-chat() { curl -s -i http://127.0.0.1:8080/v1/chat/completions -H "Authorization: Bearer $1" -d "$REQ"; }
+chat() {
+  curl -s -i -w '\ntotal=%{time_total}s\n' http://127.0.0.1:8080/v1/chat/completions \
+       -H "Authorization: Bearer $1" -d "$REQ"
+}
 
 chat demo-key-1
 # HTTP/1.1 200 OK
@@ -45,14 +50,15 @@ chat demo-key-1
 # {"id":"chatcmpl-...","object":"chat.completion","model":"gpt-test","choices":[{"index":0,
 #  "message":{"role":"assistant","content":"Hello from the primary mock provider (request #1)."},
 #  "finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":500,"total_tokens":509}}
+# total=0.007s
 
 # Primary starts answering 429 -> served by the secondary
 curl -s -X PUT http://127.0.0.1:9001/_mock/mode -d '{"mode":"429"}'
 chat demo-key-2            # 200, x-gateway-route: fallback, "Hello from the secondary mock provider ..."
 
-# Primary hangs -> failover at the 3000 ms deadline (curl reports total=3.02s)
+# Primary hangs -> failover at the 3000 ms deadline
 curl -s -X PUT http://127.0.0.1:9001/_mock/mode -d '{"mode":"slow","delay":10}'
-chat demo-key-2            # 200, x-gateway-route: fallback
+chat demo-key-2            # 200, x-gateway-route: fallback ... total=3.00s
 
 # ...and the secondary is broken too -> sanitized 503
 curl -s -X PUT http://127.0.0.1:9002/_mock/mode -d '{"mode":"500"}'
@@ -60,6 +66,7 @@ chat demo-key-2
 # HTTP/1.1 503 Service Unavailable
 # {"error":{"type":"upstream_error","code":"upstream_unavailable","message":"No model provider is
 #  available to serve this request right now. Please retry later.","request_id":"req_104d5542..."}}
+# total=3.02s
 
 # Back to healthy; exhaust demo-key-1's window
 curl -s -X PUT http://127.0.0.1:9001/_mock/mode -d '{"mode":"ok"}'
@@ -71,6 +78,7 @@ chat demo-key-1; chat demo-key-1; chat demo-key-1
 # retry-after: 38
 # {"error":{"type":"rate_limit_error","code":"tenant_token_limit_exceeded","message":"Token rate
 #  limit exceeded for this API key. Retry after 38 seconds.","request_id":"req_6d4c2555..."}}
+# total=0.002s
 ```
 
 The mock's 500 body contains a fake traceback, an internal hostname and a fake API key. The client
@@ -208,10 +216,26 @@ database is unavailable fails closed with `503 rate_limiter_unavailable`.
 
 ### Cost, reconciliation and release
 
-- **Cost** = `prompt_estimate + max_tokens`. The estimate is `ceil(utf8_bytes / 4)` per message plus
-  4 tokens of per-message overhead and 3 for reply priming. Counting UTF-8 bytes keeps CJK and emoji
-  from being under-counted. `max_tokens` is always sent upstream (the default too), so the provider
-  cannot generate more than was reserved.
+- **Cost** = `prompt_estimate + max_tokens`. The estimate is `ceil(utf8_bytes / 4)` per message
+  (content, name, tool calls) plus 4 tokens of per-message overhead and 3 for reply priming.
+  `max_tokens` is always sent upstream (the default too), so the provider cannot generate more
+  than was reserved.
+- **What the estimate is, precisely.** Four bytes per token is the typical rate for English prose
+  with BPE tokenizers, and counting UTF-8 bytes rather than characters keeps CJK and emoji from
+  being under-counted 3-4x. It is *not* an upper bound: text that tokenizes denser than 4 bytes
+  per token (`"a a a a"` is one token per 2 bytes; digits, base64, code, much CJK) is
+  under-estimated, by at most 4x for the prompt part, since no tokenizer emits more than one
+  token per byte. The reservation is therefore an upper bound on the completion and a typical
+  estimate of the prompt. What that means for the limit: a burst of in-flight requests with
+  under-estimated prompts can push a tenant past 50,000 tokens by the sum of those under-estimates,
+  reconcile then records the real usage, and the tenant is refused until the window has drained
+  it. The overshoot is bounded and paid back, never forgiven.
+- **Why not divide by 3?** A smaller divisor is not an upper bound either (only 1 byte per token
+  is), and it would make every reservation reserve a third more for typical prompts: tenants near
+  their limit would see more 429s while requests are in flight, and large English prompts would
+  hit `413 request_too_large` sooner, to shave an overshoot that reconcile already corrects.
+  `BYTES_PER_TOKEN` in `tokens.py` is one constant for deployments whose traffic is mostly code or
+  CJK.
 - **Reconcile** on success: the row's `tokens` becomes the provider's `usage.total_tokens` (or
   prompt + completion). It records the truth even if that pushes the tenant over the limit (only
   possible when the prompt estimate was low). Later requests are then refused until the window
@@ -254,6 +278,12 @@ Rows leave the window oldest first. The limiter walks the tenant's rows in `ts` 
 tokens until they cover `used + cost - limit`. The row where that happens expires at
 `ts + window`, so `Retry-After = ceil(ts + window - now)`. A request whose cost alone exceeds the
 limit can never succeed, so it gets `413 request_too_large`, not a 429 with a meaningless wait.
+
+The value is exact for the window as it stands when the request is refused. In practice it is an
+**upper bound**: in-flight requests count at their full reservation, and most of them reconcile
+lower (the completion is shorter than `max_tokens`) or are released, so room often frees up
+sooner. It can only be too short if the window grows after the decision, through the tenant's own
+concurrent requests or a prompt that reconciles above its estimate.
 
 ### Eviction
 
@@ -301,6 +331,34 @@ last attempt, and every attempt is logged.
   processed it. The residual risk is a provider that reads a request on a reused connection and
   then dies without answering: it may see the request twice. The tenant is still charged once
   (one reservation, one completion).
+
+### The deadline under load
+
+The deadline is a timer on the event loop, so it fires on time when the loop is free, and late by
+however long the loop is busy. Measured with `python benchmarks/bench_gateway.py failover`: a
+primary that never answers, one worker, mock providers and load generator on the same Windows 11
+laptop (Python 3.12). The gateway logs each attempt's elapsed time once its cancellation has been
+processed:
+
+| Requests timing out together | Primary attempt cancelled after (p50 / max) | Client latency (p50 / max) |
+|---:|---|---|
+| 1 | 3000 / 3000 ms | 3.02 / 3.02 s |
+| 100 | 3031 / 3063 ms | 3.64 / 3.99 s |
+| 200 | 3047 / 3078 ms | 4.40 / 5.09 s |
+| 400 | 3594 / 3953 ms | 7.85 / 9.44 s |
+
+Why: requests that arrive together time out together, and one thread then has to deliver each
+cancellation, unwind httpx, abort the socket, write the WARNING line and start that request's
+fallback (build it, take or open a connection) before it reaches the next. At 400 the last
+cancellation waits for the other 399. The client latency adds the fallback calls themselves (on the
+same loop, with reconciles queueing for the same limiter thread) and the load generator's own
+overhead. The order is still right: an attempt is never *used* after its deadline, and a late
+primary response is never returned (see below); only the switch to the fallback is late.
+
+How to scale: the overshoot is per event loop, so split simultaneous timeouts across processes
+(`--workers N` on Linux, where uvicorn can also use uvloop if it is installed), or across hosts
+behind a load balancer. Per worker, each upstream pool holds at most 200 connections; requests
+beyond that wait for a slot inside their own deadline.
 
 ### Why a late primary response can never be used
 
@@ -390,7 +448,11 @@ disconnects.
 ## Tests
 
 ```bash
-pytest          # about 180 tests, ~20 s; deadlines are shortened to 250-300 ms to keep them fast
+pytest          # about 330 tests, ~25 s; deadlines are shortened to 250-300 ms to keep them fast
+
+python benchmarks/bench_gateway.py limiter          # SQLite limiter alone
+python benchmarks/bench_gateway.py throughput -c 10 -n 2000 [--direct]
+python benchmarks/bench_gateway.py failover -c 1 100 200 400
 ```
 
 | File | Covers |
@@ -409,14 +471,27 @@ pytest          # about 180 tests, ~20 s; deadlines are shortened to 250-300 ms 
   processes. SQLite must sit on a local disk (its locking is unreliable on network filesystems), so
   all workers share one host clock. The remaining risk is a wall-clock step (NTP), which can make
   rows expire early or late by the size of the step.
-- **Estimate vs actual.** The pre-request estimate is a heuristic, not a tokenizer. A badly
-  under-estimated prompt can let a tenant briefly exceed the limit; reconciliation records the real
-  usage, so later requests pay for it.
+- **Estimate vs actual.** The pre-request estimate is a heuristic, not a tokenizer (see "What the
+  estimate is, precisely"). An under-estimated prompt can let a tenant briefly exceed the limit;
+  reconciliation records the real usage, so later requests pay for it.
 - **Abandoned attempts are not billed** to the tenant (see the release policy). A provider may still
   charge the operator for them.
-- **Single-host scale.** All writes for all tenants serialise on one SQLite write lock. That is
-  plenty for one host (about 9,000 reserve + reconcile pairs per second on a developer laptop, one
-  process, WAL mode). Multi-host deployments would move the same algorithm to Redis or Postgres.
+- **Single-host scale.** All writes for all tenants serialise on one SQLite write lock. Measured
+  with `benchmarks/bench_gateway.py` on a Windows 11 laptop (Python 3.12, WAL; the machine was
+  shared with other work, and repeated runs varied by up to 2x):
+  - `limiter`: about 9,000-9,700 reserve + reconcile pairs per second on one connection when each
+    tenant has a few dozen live rows, and about 2,800 per second for one tenant with 5,000 live rows,
+    because every reservation sums the tenant's live rows (5,000 is the worst case at 50,000 tokens
+    per window and ~10-token requests; the audit's 4,863/s was one tenant with 2,000 rows). Through
+    the async facade, with 400 callers queueing for the limiter thread: about 3,000 per second.
+  - `throughput`, end to end with one worker: 328 requests/s at 10 concurrent clients (p50 30 ms),
+    where the same rig driving the mock provider directly does 469/s. At 300 concurrent clients
+    both drop to about 100/s with multi-second tails (98/s through the gateway, 100/s direct; the
+    audit's ~95/s): there the Python load generator and Windows loopback are the limit, not the
+    gateway or SQLite.
+
+  So one worker's request rate is set by the Python HTTP stack, far below the limiter's; scale out
+  with workers on Linux. Multi-host deployments would move the same algorithm to Redis or Postgres.
 - **No streaming**, and no upstream circuit breaker: a primary answering 429 (or 401) is tried
   again on the next request. Upstream `Retry-After` is relayed to clients on 503 but not used for a
   gateway-side cooldown.
