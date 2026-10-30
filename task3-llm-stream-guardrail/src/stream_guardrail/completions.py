@@ -51,7 +51,9 @@ _CHOICE_KEYS = frozenset({"index", "finish_reason"})
 
 
 def _dumps(obj: Any) -> str:
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    # ASCII escapes: a lone surrogate sent by the upstream as a JSON escape decodes fine, but would
+    # make encoding the event as UTF-8 fail.
+    return json.dumps(obj, ensure_ascii=True, separators=(",", ":"))
 
 
 def _exempt(key: str, parent: Step | None) -> bool:
@@ -180,7 +182,7 @@ class ChatStreamRedactor:
             return [*self.finish(), event]
         try:
             chunk = json.loads(event.data)
-        except ValueError:
+        except (ValueError, RecursionError):  # RecursionError: nested too deeply to parse
             redact = _Counter(self.replacement)
             event.data = redact(event.data)  # not JSON: treat as opaque text
             self._closed_redactions += redact.redactions

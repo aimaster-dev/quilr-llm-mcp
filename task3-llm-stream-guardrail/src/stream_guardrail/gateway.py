@@ -5,8 +5,11 @@ Streaming path (``"stream": true``)::
     upstream bytes -> SSEParser -> ChatStreamRedactor -> SSE bytes -> client
 
 Every upstream read is parsed, redacted and written to the client before the next read. The gateway
-holds one partial SSE line plus a few characters per choice, never the response. When the client
-disconnects, the relay is cancelled and the upstream request is closed with it.
+holds one partial SSE line plus a few characters per choice, never the response.
+
+The endpoint is a plain ASGI app so that it watches for the client going away during the whole
+request: while the upstream is connecting and thinking, while a non-streaming answer is read, and
+while a stream is relayed. A disconnect cancels that work and closes the upstream request with it.
 """
 
 from __future__ import annotations
@@ -24,8 +27,8 @@ from typing import Any
 import anyio
 import httpx
 from starlette.applications import Starlette
-from starlette.requests import Request
-from starlette.responses import JSONResponse, Response, StreamingResponse
+from starlette.requests import ClientDisconnect, Request
+from starlette.responses import Response
 from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 
@@ -37,6 +40,21 @@ logger = logging.getLogger("stream_guardrail.gateway")
 
 _SAFE_TOKEN = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 _UPSTREAM_ERROR_PEEK = 64 << 10
+_SSE_HEADERS = [
+    (b"content-type", b"text/event-stream; charset=utf-8"),
+    (b"cache-control", b"no-cache"),
+    (b"x-accel-buffering", b"no"),
+]
+
+
+def json_response(content: Any, status: int = 200, headers: dict[str, str] | None = None) -> Response:
+    """A JSON response with ASCII escapes.
+
+    A lone surrogate from upstream (``"\\ud83d"``) is valid JSON and decodes fine, but cannot be
+    encoded as UTF-8; escaped, it goes through.
+    """
+    body = json.dumps(content, ensure_ascii=True, separators=(",", ":"))
+    return Response(body, status_code=status, headers=headers, media_type="application/json")
 
 
 @dataclass
@@ -62,8 +80,8 @@ class GatewayError(Exception):
             error["upstream_code"] = self.upstream_code
         return {"error": error}
 
-    def response(self) -> JSONResponse:
-        return JSONResponse(self.payload(), status_code=self.status, headers=self.headers)
+    def response(self) -> Response:
+        return json_response(self.payload(), self.status, self.headers)
 
     def event(self) -> SSEEvent:
         return SSEEvent(data=json.dumps(self.payload(), separators=(",", ":")))
@@ -75,6 +93,10 @@ def _timeout_error() -> GatewayError:
 
 def _unreachable_error() -> GatewayError:
     return GatewayError(502, "upstream_unavailable", "The upstream provider could not be reached.")
+
+
+def _internal_error() -> GatewayError:
+    return GatewayError(500, "internal_error", "The gateway failed to process the request.", "server_error")
 
 
 def _upstream_status_error(response: httpx.Response, body: bytes) -> GatewayError:
@@ -102,6 +124,8 @@ def _upstream_status_error(response: httpx.Response, body: bytes) -> GatewayErro
             "invalid_request_error",
             upstream_code=_upstream_code(body),
         )
+    if status < 400:  # a redirect (never followed) or another status that is not a success
+        return GatewayError(502, "upstream_error", "The upstream provider returned an unexpected status.")
     return GatewayError(502, "upstream_error", "The upstream provider returned an error.")
 
 
@@ -110,7 +134,7 @@ def _upstream_code(body: bytes) -> str | None:
     try:
         error = json.loads(body).get("error")
         code = error.get("code") or error.get("type")
-    except (ValueError, AttributeError):
+    except (ValueError, RecursionError, AttributeError):
         return None
     return code if isinstance(code, str) and _SAFE_TOKEN.fullmatch(code) else None
 
@@ -130,37 +154,15 @@ async def _read_limited(chunks: AsyncIterator[bytes], limit: int) -> bytes:
     return b"".join(parts)
 
 
-class EventStreamResponse(StreamingResponse):
-    """A StreamingResponse that always watches for client disconnects.
-
-    Starlette only does this for servers that speak ASGI spec < 2.4. On newer servers a disconnect
-    shows up only when the next ``send()`` fails, and that can be a long time away while the model
-    is thinking. Here ``receive()`` is always watched, so the relay (and with it the upstream
-    request) is cancelled as soon as the client goes away. The body generator is always closed.
-    """
-
-    def __init__(self, events: AsyncGenerator[bytes, None], headers: dict[str, str]) -> None:
-        super().__init__(events, media_type="text/event-stream", headers=headers)
-        self._events = events
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        try:
-            async with anyio.create_task_group() as tg:
-
-                async def stream() -> None:
-                    with contextlib.suppress(OSError):  # the client went away mid-write
-                        await self.stream_response(send)
-                    tg.cancel_scope.cancel()
-
-                tg.start_soon(stream)
-                await self.listen_for_disconnect(receive)
-                tg.cancel_scope.cancel()
-        finally:
-            with anyio.CancelScope(shield=True):
-                await self._events.aclose()
+async def _close(response: httpx.Response) -> None:
+    """Close an upstream response, even from a cancelled task (the client went away)."""
+    with anyio.CancelScope(shield=True):
+        await response.aclose()
 
 
 class Gateway:
+    """The ``POST /v1/chat/completions`` endpoint, as an ASGI app."""
+
     def __init__(
         self,
         settings: Settings,
@@ -171,22 +173,49 @@ class Gateway:
         self.client = client
         self.redactor_factory = redactor_factory
 
-    async def chat_completions(self, request: Request) -> Response:
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        request = Request(scope, receive)
         started = time.perf_counter()
         try:
             raw = await self._read_request(request)
+        except ClientDisconnect:
+            logger.info("client disconnected while sending the request")
+            return
+        except GatewayError as exc:
+            logger.warning("request rejected: status=%d code=%s", exc.status, exc.code)
+            await exc.response()(scope, receive, send)
+            return
+        # The body has been read, so receive() now only reports the disconnect. One task watches
+        # for it for as long as the request runs; whichever side finishes first cancels the other.
+        # Starlette's StreamingResponse watches only while streaming, and only on ASGI < 2.4.
+        async with anyio.create_task_group() as tg:
+
+            async def watch_disconnect() -> None:
+                while (await receive())["type"] != "http.disconnect":
+                    pass
+                logger.info("client disconnected: request cancelled, upstream closed")
+                tg.cancel_scope.cancel()
+
+            tg.start_soon(watch_disconnect)
+            await self._respond(request, raw, started, send)
+            tg.cancel_scope.cancel()
+
+    async def _respond(self, request: Request, raw: bytes, started: float, send: Send) -> None:
+        try:
             stream = self._check_request(raw)
             upstream = await self._send(request, raw, stream)
-            content_type = upstream.headers.get("content-type", "")
-            if stream and content_type.startswith("text/event-stream"):
-                return EventStreamResponse(
-                    self._relay(upstream, started),
-                    headers={"cache-control": "no-cache", "x-accel-buffering": "no"},
-                )
-            return await self._complete(upstream, started)
+            if stream and upstream.headers.get("content-type", "").startswith("text/event-stream"):
+                await self._stream(upstream, started, send)
+                return
+            response = await self._complete(upstream, started)
         except GatewayError as exc:
             logger.warning("request failed: status=%d code=%s", exc.status, exc.code)
-            return exc.response()
+            response = exc.response()
+        except Exception:
+            logger.exception("request failed: unexpected error")
+            response = _internal_error().response()
+        with contextlib.suppress(OSError):  # the client went away
+            await response(request.scope, request.receive, send)
 
     async def _read_request(self, request: Request) -> bytes:
         limit = self.settings.max_request_bytes
@@ -206,7 +235,7 @@ class Gateway:
         """Refuse what the gateway cannot redact; return whether the client asked for a stream."""
         try:
             body = json.loads(raw)
-        except ValueError:
+        except (ValueError, RecursionError):  # RecursionError: nested too deeply to parse
             raise GatewayError(
                 400, "invalid_json", "Request body must be JSON.", "invalid_request_error"
             ) from None
@@ -257,7 +286,7 @@ class Gateway:
             raise _timeout_error() from None
         except httpx.HTTPError:
             raise _unreachable_error() from None
-        if response.status_code < 400:
+        if 200 <= response.status_code < 300:
             return response
         body = b""
         try:
@@ -265,7 +294,7 @@ class Gateway:
         except (httpx.HTTPError, _BodyTooLarge):
             pass
         finally:
-            await response.aclose()
+            await _close(response)
         logger.info("upstream returned status %d", response.status_code)
         raise _upstream_status_error(response, body)
 
@@ -281,20 +310,42 @@ class Gateway:
                 502, "upstream_response_too_large", "The upstream response is too large."
             ) from None
         finally:
-            await upstream.aclose()
+            await _close(upstream)
         try:
             body = json.loads(raw)
-        except ValueError:
+        except (ValueError, RecursionError):
             raise GatewayError(
                 502, "upstream_invalid_response", "The upstream response is not valid JSON."
             ) from None
-        body, redactions = redact_completion(body)
+        try:
+            body, redactions = redact_completion(body)
+        except RecursionError:
+            raise GatewayError(
+                502, "upstream_invalid_response", "The upstream response is nested too deeply."
+            ) from None
         logger.info(
             "completion relayed: stream=false redactions=%d duration_ms=%.1f",
             redactions,
             (time.perf_counter() - started) * 1000,
         )
-        return JSONResponse(body, status_code=upstream.status_code)
+        return json_response(body, upstream.status_code)
+
+    async def _stream(self, upstream: httpx.Response, started: float, send: Send) -> None:
+        """Send the redacted event stream. Failures after the status line are reported in-band."""
+        events = self._relay(upstream, started)
+        try:
+            await send({"type": "http.response.start", "status": 200, "headers": _SSE_HEADERS})
+            async for chunk in events:
+                await send({"type": "http.response.body", "body": chunk, "more_body": True})
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+        except OSError:
+            logger.info("client disconnected during the stream")
+        except Exception:
+            logger.exception("stream failed: unexpected error while sending")
+        finally:
+            with anyio.CancelScope(shield=True):
+                await events.aclose()
+            await _close(upstream)  # also when the relay never started
 
     async def _relay(self, upstream: httpx.Response, started: float) -> AsyncGenerator[bytes, None]:
         parser = SSEParser(self.settings.max_event_size)
@@ -323,14 +374,23 @@ class Gateway:
                 error = GatewayError(
                     502, "upstream_invalid_stream", "The upstream sent a malformed event stream."
                 )
+            except Exception:
+                # Last resort: never let a bug end the response with a broken chunked encoding.
+                logger.exception("stream failed: unexpected error while relaying")
+                error = GatewayError(
+                    500, "internal_error", "The gateway failed while relaying the response.", "server_error"
+                )
             if error is not None:
                 # Release what was held (redacted as end-of-text), then report the failure in-band:
-                # the 200 status line has already been sent.
+                # the 200 status line has already been sent. If the redactor itself failed, its
+                # held text is dropped rather than risked.
                 logger.warning("stream aborted: code=%s", error.code)
-                yield b"".join(e.encode() for e in redactor.finish()) + error.event().encode()
+                tail = b""
+                with contextlib.suppress(Exception):
+                    tail = b"".join(e.encode() for e in redactor.finish())
+                yield tail + error.event().encode()
         finally:
-            with anyio.CancelScope(shield=True):
-                await upstream.aclose()
+            await _close(upstream)
             logger.info(
                 "completion relayed: stream=true redactions=%d first_event_ms=%s duration_ms=%.1f",
                 redactor.redactions,
@@ -371,12 +431,18 @@ def create_app(
                 await gateway.client.aclose()
 
     async def healthz(request: Request) -> Response:
-        return JSONResponse({"status": "ok"})
+        return json_response({"status": "ok"})
+
+    async def internal_error(request: Request, exc: Exception) -> Response:
+        # Anything that escaped the endpoint's own handling: the OpenAI error shape, no details.
+        # Starlette logs the exception and re-raises it for the server.
+        return _internal_error().response()
 
     return Starlette(
         routes=[
-            Route("/v1/chat/completions", gateway.chat_completions, methods=["POST"]),
+            Route("/v1/chat/completions", gateway, methods=["POST"]),
             Route("/healthz", healthz, methods=["GET"]),
         ],
+        exception_handlers={Exception: internal_error},
         lifespan=lifespan,
     )

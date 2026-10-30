@@ -94,10 +94,16 @@ upstream bytes ─▶ SSEParser ─▶ ChatStreamRedactor ─▶ SSE bytes ─�
   `choices[].message`, one shot.
 - **Payloads it does not recognise** (a mid-stream `{"error": …}`, non-JSON `data:`) are redacted
   as plain text rather than passed through.
-- **Client disconnect cancels the upstream request** immediately, even while the model is silent.
-  Starlette's `StreamingResponse` only watches for disconnects on ASGI spec < 2.4 servers.
-  `EventStreamResponse` always watches `receive()`, and the relay closes the upstream response in
-  a shielded `finally`.
+- **Client disconnect cancels the upstream request** immediately, in every phase: while the
+  provider is still thinking (no status line sent yet), while a non-streaming answer is being
+  read, and while a stream is relayed. The endpoint is a plain ASGI app: once the request body is
+  read, one task watches `receive()` for `http.disconnect` for the rest of the request and cancels
+  the work, and the upstream response is closed in a shielded `finally`. (Starlette's
+  `StreamingResponse` only watches while streaming, and only on ASGI spec < 2.4 servers.)
+- **Nothing unexpected reaches the client.** JSON goes out with ASCII escapes, so a lone surrogate
+  from the provider (`"\ud83d"`) cannot break the encoding. A bug while relaying a stream ends it
+  with held text flushed and an in-band `internal_error` event, not a broken chunked body; anything
+  else becomes a 500 in the OpenAI error shape, with details only in the log.
 - **Credentials.** The client's `Authorization` and cookies are never forwarded. Only the
   gateway's own key, `x-request-id` (if it is a safe token) and `accept-encoding: identity` go
   upstream. `identity` matters because compression would make the provider buffer tokens.
@@ -109,7 +115,7 @@ OpenAI's shape: `{"error": {"message", "type", "param", "code"}}`.
 
 | Situation | Client gets |
 |-----------|-------------|
-| Body is not JSON, or not an object / too large | 400 `invalid_json` / `invalid_request`, 413 `request_too_large` (upstream not called) |
+| Body is not JSON (or nested too deeply to parse), or not an object / too large | 400 `invalid_json` / `invalid_request`, 413 `request_too_large` (upstream not called) |
 | `logprobs` / `top_logprobs` requested | 400 `logprobs_not_supported`, `param` names the field (upstream not called) |
 | Audio output requested (`modalities`, `audio`) | 400 `audio_not_supported` (upstream not called) |
 | Upstream 400/404/409/413/415/422 | Same status, `upstream_rejected_request`, plus `upstream_code` if the provider sent a safe machine-readable code such as `model_not_found` |
@@ -117,7 +123,10 @@ OpenAI's shape: `{"error": {"message", "type", "param", "code"}}`.
 | Upstream 429 | 429 `rate_limited`, `Retry-After` passed through if it is a plain token |
 | Upstream 408/504, connect/read timeout | 504 `upstream_timeout` |
 | Upstream 5xx, connection refused | 502 `upstream_error` / `upstream_unavailable` |
+| Upstream 3xx (redirects are never followed) or any other non-2xx | 502 `upstream_error`; no `Location`, no body |
+| Unexpected gateway error before the response started | 500 `internal_error` (`type: server_error`) |
 | Failure **after** streaming started | Held text is flushed (redacted), then `data: {"error": {…"code":"upstream_stream_error"}}`; no `[DONE]` |
+| Unexpected gateway error **after** streaming started | Held text is flushed (if the redactor can), then an in-band `internal_error` event; no `[DONE]` |
 
 ## Redaction engine
 
@@ -227,9 +236,9 @@ word, a partial email, or a partial digit group.
 | Engine (`test_redaction*.py`) | Detector semantics; **streaming == one-shot for any chunking** (Hypothesis + exhaustive 2/3-way splits); buffer ≤ `MAX_BUFFERED` after every chunk; nothing held across `\n`; long runs released |
 | SSE (`test_sse.py`) | Same events for every byte split point, byte-by-byte and random splits (UTF-8, `\r\n`, `\r`) |
 | Chunk transformer (`test_completions.py`) | Every delta and message field redacted (content parts, reasoning, audio transcript, tool and legacy function arguments, unknown fields), structural values intact, logprobs dropped, tool calls keyed by `index`; Hypothesis: any interleaving of fields and choices reads as one-shot redaction, with nothing after `finish_reason`; `[DONE]`/EOF flush, dropped empty chunks |
-| Gateway (`test_gateway.py`) | Redacted SSE, credential handling, sanitized error mapping, mid-stream failure, **disconnect cancels upstream** |
+| Gateway (`test_gateway.py`) | Redacted SSE, credential handling, refused logprobs/audio, sanitized error mapping (non-2xx, lone surrogates, deep JSON, unexpected exceptions in-band and as a 500), mid-stream failure, **disconnect cancels upstream** before the status line, while reading a complete answer and while streaming |
 | Latency and memory (`test_streaming_latency.py`) | **First safe delta reaches the client while the upstream is blocked** waiting for it (a buffering gateway deadlocks); held text waits for one delta only; redactor peak < 64 chars over 5,000+ deltas; traced memory ~100 KB for a 1 MB stream |
-| Real sockets (`test_end_to_end.py`) | Same guarantees over uvicorn + loopback TCP, including disconnect cancellation |
+| Real sockets (`test_end_to_end.py`) | Same guarantees over uvicorn + loopback TCP, including disconnect cancellation; a raw socket closed while the provider is still thinking (streaming or not) makes the gateway hang up on the provider |
 
 `httpx.ASGITransport` buffers the whole response, so it cannot show streaming. The tests drive the
 gateway through the raw ASGI interface (`tests/asgi.py`) and reach the mock provider through

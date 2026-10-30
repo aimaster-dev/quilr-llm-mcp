@@ -10,7 +10,8 @@ import httpx
 import pytest
 from starlette.applications import Starlette
 
-from stream_guardrail.gateway import create_app
+from stream_guardrail.completions import ChatStreamRedactor
+from stream_guardrail.gateway import Gateway, create_app
 from stream_guardrail.redaction import REDACTED
 from stream_guardrail.sse import SSEEvent, SSEParser
 from tests.asgi import asgi_request
@@ -395,6 +396,214 @@ async def test_client_disconnect_cancels_the_upstream_request(make_gateway: Make
             response.disconnect()
             await upstream_closed.wait()
     assert not response.complete
+
+
+@pytest.mark.parametrize("request_body", [PLAIN_REQUEST, STREAM_REQUEST], ids=["non-streaming", "streaming"])
+async def test_client_disconnect_before_the_upstream_answers_cancels_it(
+    make_gateway: MakeGateway, request_body: dict[str, object]
+) -> None:
+    # The model is still thinking: no status line has been sent to the client yet.
+    upstream_started, upstream_cancelled = anyio.Event(), anyio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        upstream_started.set()
+        try:
+            await anyio.sleep_forever()
+        finally:
+            upstream_cancelled.set()
+        raise AssertionError("unreachable")
+
+    app, _ = make_gateway(handler)
+    with anyio.fail_after(5):
+        async with asgi_request(app, PATH, request_body, wait_for_start=False) as response:
+            await upstream_started.wait()
+            response.disconnect()
+            await upstream_cancelled.wait()
+            await response.app_done.wait()
+    assert response.status == 0  # nothing was sent
+
+
+async def test_client_disconnect_while_reading_a_complete_answer_cancels_it(
+    make_gateway: MakeGateway,
+) -> None:
+    body_started, upstream_closed = anyio.Event(), anyio.Event()
+
+    async def slow_body() -> AsyncIterator[bytes]:
+        try:
+            yield b'{"choices": [{"index": 0, "message": {"content": "'
+            body_started.set()
+            await anyio.sleep_forever()
+        finally:
+            upstream_closed.set()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "application/json"}, content=slow_body())
+
+    app, _ = make_gateway(handler)
+    with anyio.fail_after(5):
+        async with asgi_request(app, PATH, PLAIN_REQUEST, wait_for_start=False) as response:
+            await body_started.wait()
+            response.disconnect()
+            await upstream_closed.wait()
+            await response.app_done.wait()
+
+
+async def test_lone_surrogates_from_upstream_are_escaped(make_gateway: MakeGateway) -> None:
+    # "\ud83d" is valid JSON but not encodable as UTF-8; the gateway used to crash on it.
+    chunk = b'{"choices":[{"index":0,"delta":{"content":"Hi \\ud83d a@b.io!"},"finish_reason":null}]}'
+    complete = b'{"choices":[{"index":0,"message":{"content":"Hi \\ud83d a@b.io!"}}]}'
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if json.loads(request.content).get("stream"):
+            return sse_response([b"data: " + chunk + b"\n\n" + sse("[DONE]")])
+        return httpx.Response(200, headers={"content-type": "application/json"}, content=complete)
+
+    app, _ = make_gateway(handler)
+    async with asgi_request(app, PATH, STREAM_REQUEST) as response:
+        streamed = await response.read()
+    async with asgi_request(app, PATH, PLAIN_REQUEST) as response:
+        plain = await response.read()
+    assert response.status == 200
+    assert response.headers["content-type"] == "application/json"
+    assert content_of(events_of(streamed)) == f"Hi \ud83d {R}!"
+    assert events_of(streamed)[-1].data == "[DONE]"
+    assert json.loads(plain)["choices"][0]["message"]["content"] == f"Hi \ud83d {R}!"
+    assert streamed.isascii()
+    assert plain.isascii()
+
+
+async def test_deeply_nested_json_is_handled(make_gateway: MakeGateway) -> None:
+    deep = b"[" * 100_000 + b"]" * 100_000
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if json.loads(request.content).get("stream"):
+            return sse_response([b"data: " + deep + b"\n\n", content_stream("still here")])
+        return httpx.Response(200, headers={"content-type": "application/json"}, content=deep)
+
+    app, upstream = make_gateway(handler)
+    # Request: refused before the upstream is called.
+    async with asgi_request(app, PATH, b'{"messages": ' + deep + b"}") as response:
+        error = (await response.json())["error"]
+    assert (response.status, error["code"]) == (400, "invalid_json")
+    assert upstream.requests == []
+    # Complete answer: a sanitized 502.
+    async with asgi_request(app, PATH, PLAIN_REQUEST) as response:
+        error = (await response.json())["error"]
+    assert (response.status, error["code"]) == (502, "upstream_invalid_response")
+    # Streamed event: redacted as plain text, and the stream goes on.
+    async with asgi_request(app, PATH, STREAM_REQUEST) as response:
+        events = events_of(await response.read())
+    assert content_of([e for e in events if e.data and e.data.startswith("{")]) == "still here"
+    assert events[-1].data == "[DONE]"
+
+
+class ExplodingRedactor(ChatStreamRedactor):
+    """Fails on the third event with an exception whose text must never reach the client."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.events = 0
+
+    def process(self, event: SSEEvent) -> list[SSEEvent]:
+        self.events += 1
+        if self.events == 3:
+            raise RuntimeError("internal detail: secret-token-123")
+        return super().process(event)
+
+
+async def test_unexpected_relay_error_flushes_then_reports_in_band() -> None:
+    raw = content_stream("Write to ann@ex", "ample.com", "more")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return sse_response([raw])
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        app = create_app(SETTINGS, client, redactor_factory=ExplodingRedactor)
+        async with asgi_request(app, PATH, STREAM_REQUEST) as response:
+            body = await response.read()
+    assert response.complete  # a clean end of the chunked body, not a broken connection
+    events = events_of(body)
+    error = json.loads(events[-1].data or "")["error"]
+    assert error == {
+        "message": "The gateway failed while relaying the response.",
+        "type": "server_error",
+        "param": None,
+        "code": "internal_error",
+    }
+    # "ann@ex" was held when the failure hit; it is flushed (as end-of-text), never raw "ann@example".
+    assert content_of(events[:-1]) == "Write to ann@ex"
+    assert b"example" not in body
+    assert b"secret-token" not in body
+    assert all(event.data != "[DONE]" for event in events)
+
+
+async def test_unexpected_error_before_streaming_is_a_sanitized_500(make_gateway: MakeGateway) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise RuntimeError("internal detail: secret-token-123")  # not an httpx error
+
+    app, _ = make_gateway(handler)
+    for request_body in (STREAM_REQUEST, PLAIN_REQUEST):
+        async with asgi_request(app, PATH, request_body) as response:
+            raw = await response.read()
+        assert response.status == 500
+        assert json.loads(raw)["error"]["code"] == "internal_error"
+        assert b"secret-token" not in raw
+
+
+async def test_app_level_errors_use_the_openai_shape(
+    make_gateway: MakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def explode(self: object, request: object) -> bytes:
+        raise RuntimeError("internal detail: secret-token-123")
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("upstream must not be called")
+
+    monkeypatch.setattr(Gateway, "_read_request", explode)
+    app, _ = make_gateway(handler)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as client:
+        response = await client.post(PATH, json=PLAIN_REQUEST)
+    assert response.status_code == 500
+    assert response.headers["content-type"] == "application/json"
+    assert response.json() == {
+        "error": {
+            "message": "The gateway failed to process the request.",
+            "type": "server_error",
+            "param": None,
+            "code": "internal_error",
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    ("upstream_status", "headers", "code"),
+    [
+        (301, {"location": "https://internal.example/v1"}, "upstream_error"),
+        (302, {"location": "https://internal.example/v1"}, "upstream_error"),
+        (307, {"location": "https://internal.example/v1"}, "upstream_error"),
+        (304, {}, "upstream_error"),
+        (204, {}, "upstream_invalid_response"),  # a success without a body
+    ],
+)
+async def test_non_2xx_and_bodyless_answers_are_sanitized(
+    make_gateway: MakeGateway, upstream_status: int, headers: dict[str, str], code: str
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        content = b"" if upstream_status in (204, 304) else b'{"redirect": "john@example.com"}'
+        return httpx.Response(
+            upstream_status, headers={"content-type": "application/json", **headers}, content=content
+        )
+
+    app, _ = make_gateway(handler)
+    for request_body in (STREAM_REQUEST, PLAIN_REQUEST):
+        async with asgi_request(app, PATH, request_body) as response:
+            raw = await response.read()
+        assert response.status == 502
+        assert "location" not in response.headers
+        assert json.loads(raw)["error"]["code"] == code
+        assert b"john" not in raw
+        assert b"internal.example" not in raw
 
 
 async def test_comments_are_forwarded_as_keep_alives(make_gateway: MakeGateway) -> None:

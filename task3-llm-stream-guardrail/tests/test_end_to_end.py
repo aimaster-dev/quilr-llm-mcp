@@ -7,6 +7,7 @@ import json
 import anyio
 import httpx
 import pytest
+from starlette.types import Receive, Scope, Send
 
 from stream_guardrail.config import Settings
 from stream_guardrail.gateway import create_app
@@ -82,3 +83,38 @@ async def test_client_disconnect_cancels_the_upstream_over_tcp() -> None:
                     await upstream_ended.wait()
     assert outcomes == [False]
     assert provider.stats.cancelled == 1
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["non-streaming", "streaming-before-headers"])
+async def test_closed_socket_cancels_the_upstream_before_it_answers(stream: bool) -> None:
+    # The upstream is still "thinking", so the gateway has not sent a status line yet. A raw
+    # socket that is closed is the realistic disconnect: uvicorn reports it via receive().
+    started, cancelled = anyio.Event(), anyio.Event()
+
+    async def thinking_upstream(scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            return
+        while (await receive()).get("more_body"):
+            pass
+        started.set()
+        while (await receive())["type"] != "http.disconnect":  # the gateway hung up on us
+            pass
+        cancelled.set()
+
+    body = json.dumps({**REQUEST, "stream": stream}).encode()
+    with anyio.fail_after(20):
+        async with serve(thinking_upstream) as upstream_url:
+            gateway = create_app(Settings(upstream_base_url=f"{upstream_url}/v1"))
+            async with serve(gateway) as gateway_url:
+                port = int(gateway_url.rsplit(":", 1)[1])
+                async with await anyio.connect_tcp("127.0.0.1", port) as client:
+                    await client.send(
+                        b"POST /v1/chat/completions HTTP/1.1\r\nHost: gateway\r\n"
+                        b"Content-Type: application/json\r\n"
+                        + f"Content-Length: {len(body)}\r\n\r\n".encode()
+                        + body
+                    )
+                    await started.wait()
+                # The socket is closed. The gateway must hang up on the upstream promptly.
+                with anyio.fail_after(5):
+                    await cancelled.wait()
