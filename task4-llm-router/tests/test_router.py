@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import random
 
 import anyio
@@ -16,6 +18,7 @@ from llm_router.errors import (
     UpstreamUnavailableError,
 )
 from llm_router.router import (
+    DEFAULT_KEEPALIVE_EXPIRY_SECONDS,
     DEFAULT_PRIMARY_TIMEOUT_SECONDS,
     Completion,
     FailoverPolicy,
@@ -31,6 +34,7 @@ from tests.upstreams import (
     drip,
     ok,
     respond,
+    scripted_server,
 )
 
 pytestmark = pytest.mark.anyio
@@ -134,13 +138,21 @@ async def test_only_whitelisted_response_fields_are_kept() -> None:
         ({"prompt_tokens": 5, "completion_tokens": 7}, 12),
         ({"prompt_tokens": 5}, None),
         (None, None),
+        # Malformed counts are dropped, never a reason to discard (and fail over) a completion.
+        ({"prompt_tokens": 5, "completion_tokens": -7, "total_tokens": -2}, None),
+        ({"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": "12"}, 12),
+        ({"total_tokens": 1.5}, None),
+        ({"total_tokens": False}, None),
+        ([1, 2, 3], None),
+        ("lots", None),
     ],
 )
-async def test_total_tokens_falls_back_sensibly(usage: dict | None, expected: int | None) -> None:
+async def test_total_tokens_falls_back_sensibly(usage: object, expected: int | None) -> None:
     body = completion_body(total_tokens=None)
     if usage is not None:
         body["usage"] = usage
     completion = await run(make_router(Recorder(respond(200, json_body=body)), None))
+    assert completion.route == "primary"
     assert completion.total_tokens == expected
 
 
@@ -246,8 +258,8 @@ async def test_timed_out_socket_is_closed_not_returned_to_the_pool() -> None:
 # -- which failures are retried ------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("status", [400, 401, 403, 404, 413, 422])
-async def test_non_retryable_4xx_is_not_sent_to_the_secondary(status: int) -> None:
+@pytest.mark.parametrize("status", [400, 413, 422])
+async def test_an_invalid_request_is_not_sent_to_the_secondary(status: int) -> None:
     secondary = Recorder(ok())
     error = await fail(make_router(Recorder(respond(status, json_body={"error": "nope"})), secondary))
 
@@ -255,10 +267,32 @@ async def test_non_retryable_4xx_is_not_sent_to_the_secondary(status: int) -> No
     assert error.failures[-1].status == status
     assert len(error.failures) == 1
     assert secondary.requests == []
-    # A malformed request is the client's problem (400); a provider refusing the gateway's own
-    # credentials or model is not, so the client sees a 502 instead.
-    if status in (400, 413, 422):
-        assert type(error) is UpstreamRejectedError and error.status == 400
+    assert type(error) is UpstreamRejectedError and error.status == 400  # the client's problem
+
+
+REFUSALS = [401, 402, 403, 404, 405, 408, 409, 410, 425, 451]
+
+
+@pytest.mark.parametrize("status", REFUSALS)
+async def test_a_refusing_primary_fails_over_by_default(status: int) -> None:
+    # An expired provider key, a wrong model or URL, the provider's own timeout: another provider
+    # may well serve the same request.
+    secondary = Recorder(ok("from secondary"))
+    completion = await run(make_router(Recorder(respond(status, json_body={"error": "nope"})), secondary))
+    assert completion.route == "fallback"
+    assert [(f.kind, f.status) for f in completion.failed_attempts] == [(FailureKind.REFUSED, status)]
+
+
+@pytest.mark.parametrize("status", REFUSALS)
+async def test_failover_on_refusal_can_be_disabled(status: int) -> None:
+    secondary = Recorder(ok())
+    policy = FailoverPolicy(on_refused=False)
+    error = await fail(make_router(Recorder(respond(status, json_body={"error": "nope"})), secondary, policy))
+    assert error.failures[-1].kind is FailureKind.REFUSED
+    assert secondary.requests == []
+    # A misconfigured provider is the operator's problem (502); a transient refusal is "retry later".
+    if status in (408, 409, 425):
+        assert type(error) is UpstreamUnavailableError and error.status == 503
     else:
         assert type(error) is UpstreamError and error.status == 502
 
@@ -291,8 +325,160 @@ async def test_connection_and_server_failover_can_be_disabled(handler, kind: Fai
 
 @pytest.mark.parametrize("kind", list(FailureKind))
 def test_429_and_timeouts_always_fail_over(kind: FailureKind) -> None:
-    strict = FailoverPolicy(on_connection_error=False, on_server_error=False)
+    strict = FailoverPolicy(on_connection_error=False, on_server_error=False, on_refused=False)
     assert strict.should_failover(kind) is (kind in {FailureKind.RATE_LIMITED, FailureKind.TIMEOUT})
+    assert FailoverPolicy().should_failover(kind) is (kind is not FailureKind.CLIENT_ERROR)
+
+
+# -- stale keep-alive connections (real sockets) -------------------------------------------------
+
+
+def socket_router(url: str, secondary: Recorder, **kwargs) -> ModelRouter:
+    # A generous deadline: nothing here waits on it, and the retry must fit inside it.
+    return ModelRouter(
+        Upstream("primary", url, "primary-model", 2.0),
+        Upstream("fallback", "https://backup.example/v1", "backup-model", SECONDARY_TIMEOUT),
+        transports={"fallback": secondary.transport},
+        **kwargs,
+    )
+
+
+async def test_a_pooled_connection_closed_by_the_provider_is_retried_once_on_a_new_one(caplog) -> None:
+    caplog.set_level(logging.INFO, logger="llm_router")
+    # Connection 0 answers once, then is closed under the second request (the provider's idle
+    # timeout firing as the connection is reused). Connection 1 answers.
+    script = {(0, 0): "ok", (0, 1): "close", (1, 0): "ok"}
+    secondary = Recorder(ok())
+    async with (
+        scripted_server(lambda c, n: script[c, n]) as server,
+        socket_router(server.url, secondary) as router,
+    ):
+        first = await router.complete(REQUEST)
+        second = await router.complete(REQUEST)
+
+    assert (first.route, second.route) == ("primary", "primary")
+    assert second.failed_attempts == ()
+    assert server.requests == [(0, 0), (0, 1), (1, 0)]
+    assert secondary.requests == []
+    assert any("retrying once on a new connection" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    ("script", "calls"),
+    [
+        # A brand-new connection that dies: the provider may have read the request; never resend.
+        pytest.param({(0, 0): "close"}, 1, id="fresh-connection"),
+        # A reused connection whose response had started: the provider has processed the request.
+        pytest.param({(0, 0): "ok", (0, 1): "headers-then-close"}, 2, id="response-started"),
+        # The retry itself fails on its new connection: no second retry.
+        pytest.param({(0, 0): "ok", (0, 1): "close", (1, 0): "close"}, 2, id="retry-fails"),
+    ],
+)
+async def test_a_request_the_provider_may_have_processed_is_never_resent(script: dict, calls: int) -> None:
+    secondary = Recorder(ok("from secondary"))
+    async with (
+        scripted_server(lambda c, n: script[c, n]) as server,
+        socket_router(server.url, secondary) as router,
+    ):
+        completions = [await router.complete(REQUEST) for _ in range(calls)]
+
+    final = completions[-1]
+    assert final.route == "fallback"
+    assert final.failed_attempts[0].kind is FailureKind.CONNECTION
+    assert sorted(server.requests) == sorted(script)  # every scripted request exactly once
+    assert len(secondary.requests) == 1
+
+
+async def test_idle_pooled_connections_expire_before_typical_server_keepalive() -> None:
+    assert DEFAULT_KEEPALIVE_EXPIRY_SECONDS < 5  # uvicorn and Node close idle connections after 5 s
+    secondary = Recorder(ok())
+    async with (
+        scripted_server(lambda c, n: "ok") as server,
+        socket_router(server.url, secondary, keepalive_expiry=0.1) as router,
+    ):
+        await router.complete(REQUEST)
+        await router.complete(REQUEST)  # immediately: the pooled connection is reused
+        await anyio.sleep(0.3)
+        await router.complete(REQUEST)  # after the expiry: a new connection
+    assert server.requests == [(0, 0), (0, 1), (1, 0)]
+
+
+# -- upstream Retry-After ------------------------------------------------------------------------
+
+
+async def test_the_smallest_upstream_retry_after_reaches_the_503() -> None:
+    primary = Recorder(respond(429, json_body={"error": "busy"}, headers={"Retry-After": "7"}))
+    secondary = Recorder(respond(429, json_body={"error": "busy"}, headers={"Retry-After": "3"}))
+    error = await fail(make_router(primary, secondary))
+    assert isinstance(error, UpstreamUnavailableError)
+    assert error.headers == {"Retry-After": "3"}
+    assert [f.retry_after for f in error.failures] == [7, 3]
+
+
+async def test_an_unusable_upstream_retry_after_is_dropped() -> None:
+    primary = Recorder(respond(429, text="busy", headers={"Retry-After": "soon, sk-live-SECRET"}))
+    error = await fail(make_router(primary, None))
+    assert isinstance(error, UpstreamUnavailableError)
+    assert "Retry-After" not in error.headers
+    assert "sk-live-SECRET" in error.failures[0].detail  # logged, never relayed
+
+
+# -- response size cap ---------------------------------------------------------------------------
+
+
+class BigStream(httpx.AsyncByteStream):
+    """A body of ``chunks`` x 64 KiB that records how much of it was pulled."""
+
+    def __init__(self, chunks: int) -> None:
+        self.chunks = chunks
+        self.sent = 0
+
+    async def __aiter__(self):
+        for _ in range(self.chunks):
+            self.sent += 1
+            yield b" " * 65_536
+
+
+def sized_router(primary: Recorder, secondary: Recorder | None, limit: int) -> ModelRouter:
+    router = make_router(primary, secondary)
+    router.max_response_bytes = limit
+    return router
+
+
+async def test_an_oversized_response_is_a_bad_response_and_is_not_read_to_the_end() -> None:
+    stream = BigStream(chunks=1_000)  # 64 MiB if read to the end, without a content-length
+
+    async def big(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=stream)
+
+    completion = await run(sized_router(Recorder(big), Recorder(ok("from secondary")), limit=256 * 1024))
+
+    assert completion.route == "fallback"
+    [failure] = completion.failed_attempts
+    assert failure.kind is FailureKind.BAD_RESPONSE
+    assert "larger than 262144 bytes" in failure.detail
+    assert stream.sent <= 5  # stopped right after the limit, not after 64 MiB
+
+
+async def test_a_declared_oversized_response_is_refused_before_reading() -> None:
+    body = completion_body("x" * 5_000)
+    primary = Recorder(respond(200, json_body=body))
+    completion = await run(sized_router(primary, Recorder(ok("from secondary")), limit=4_096))
+    assert completion.route == "fallback"
+    assert completion.failed_attempts[0].kind is FailureKind.BAD_RESPONSE
+
+
+async def test_a_response_at_the_limit_is_accepted() -> None:
+    body = json.dumps(completion_body("hello")).encode()
+    primary = Recorder(respond(200, text=body.decode(), headers={"content-type": "application/json"}))
+    completion = await run(sized_router(primary, None, limit=len(body)))
+    assert completion.route == "primary"
+
+
+async def test_an_oversized_error_body_keeps_its_status_meaning() -> None:
+    primary = Recorder(respond(503, text="x" * 10_000))
+    completion = await run(sized_router(primary, Recorder(ok()), limit=1_024))
+    assert completion.failed_attempts[0].kind is FailureKind.SERVER_ERROR
 
 
 # -- nothing works -------------------------------------------------------------------------------

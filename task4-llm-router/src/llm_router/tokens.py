@@ -9,12 +9,16 @@ later with the provider's reported `usage`. The heuristic is deliberately simple
 * each chat message adds a fixed overhead for the role and separators, and the reply is primed
   with a few tokens, mirroring the OpenAI chat format.
 
-A request's cost is ``prompt_estimate + max_tokens``: the provider can never generate more than
-``max_tokens``, so the reservation is an upper bound unless the prompt estimate is too low.
+This is a typical-case estimate, not an upper bound: text denser than 4 bytes per token ("a a a",
+digits, base64, code, much CJK) is under-estimated, by at most 4x since no tokenizer emits more
+than one token per byte. A request's cost is ``prompt_estimate + max_tokens``: the provider can
+never generate more than ``max_tokens``, so the reservation bounds the completion exactly and the
+prompt typically. Reconciliation with the provider's ``usage`` corrects the difference.
 """
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Iterable, Mapping
 from typing import Any
@@ -46,14 +50,22 @@ def _content_text(content: Any) -> str:
 
 
 def estimate_prompt_tokens(messages: Iterable[Mapping[str, Any]]) -> int:
-    """Estimate the prompt tokens of a list of chat messages."""
+    """Estimate the prompt tokens of a list of chat messages.
+
+    Tool calls in the history are counted as their JSON text (ids, function names, arguments),
+    which a provider also has to tokenize.
+    """
     total = REPLY_PRIMING_TOKENS
     for message in messages:
         total += MESSAGE_OVERHEAD_TOKENS
         total += estimate_text_tokens(_content_text(message.get("content")))
-        name = message.get("name")
-        if isinstance(name, str):
-            total += estimate_text_tokens(name)
+        for key in ("name", "tool_call_id"):
+            value = message.get(key)
+            if isinstance(value, str):
+                total += estimate_text_tokens(value)
+        tool_calls = message.get("tool_calls")
+        if tool_calls:
+            total += estimate_text_tokens(json.dumps(tool_calls, ensure_ascii=False, separators=(",", ":")))
     return total
 
 
@@ -62,3 +74,29 @@ def request_cost(prompt_tokens: int, max_tokens: int) -> int:
     if prompt_tokens < 0 or max_tokens < 0:
         raise ValueError("token counts must be non-negative")
     return prompt_tokens + max_tokens
+
+
+def max_plausible_usage(prompt_tokens: int, max_tokens: int) -> int:
+    """The most tokens a correct provider can report for a request.
+
+    * The completion is capped by ``max_tokens``, which the gateway always sends upstream.
+    * A token covers at least one byte of text (byte-level BPE and byte-fallback tokenizers), so
+      the real prompt is at most ``BYTES_PER_TOKEN`` times its ``bytes / BYTES_PER_TOKEN``
+      estimate. Multiplying the per-message overhead too leaves room for chat-template tokens.
+    """
+    return max_tokens + BYTES_PER_TOKEN * prompt_tokens
+
+
+def accepted_usage(reported: int | None, *, prompt_tokens: int, max_tokens: int) -> int | None:
+    """The provider-reported total to charge, or ``None`` to keep the gateway's own reservation.
+
+    A report is accepted only if a correct provider could have produced it for this request:
+    ``1 <= reported <= max_plausible_usage(...)``. Anything else (zero, which some servers send
+    when they do not count, negative, absurdly large, missing) says nothing about the real usage,
+    so neither it nor a clamped version of it is charged. The reservation (prompt estimate plus
+    ``max_tokens``) is the gateway's own bound and is kept instead: a broken provider can neither
+    make requests free nor lock a tenant out.
+    """
+    if reported is None or not 1 <= reported <= max_plausible_usage(prompt_tokens, max_tokens):
+        return None
+    return reported

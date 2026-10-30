@@ -33,7 +33,14 @@ from llm_router.errors import (
 )
 from llm_router.logging_config import RequestIdFilter
 from llm_router.middleware import EXCEPTION_HANDLERS, MIDDLEWARE, current_request_id
-from llm_router.router import AttemptFailure, FailureKind, ModelRouter, Upstream, gateway_error_for
+from llm_router.router import (
+    AttemptFailure,
+    FailureKind,
+    ModelRouter,
+    Upstream,
+    gateway_error_for,
+    parse_retry_after,
+)
 from tests.upstreams import Recorder, ok, respond
 
 SECRET = "sk-live-UPSTREAM-SECRET-9f8e7d6c"
@@ -96,8 +103,13 @@ def failure(kind: FailureKind, status: int | None = None, upstream: str = "prima
         (failure(FailureKind.BAD_RESPONSE, 200), UpstreamError),
         (failure(FailureKind.CLIENT_ERROR, 400), UpstreamRejectedError),
         (failure(FailureKind.CLIENT_ERROR, 422), UpstreamRejectedError),
-        (failure(FailureKind.CLIENT_ERROR, 401), UpstreamError),
-        (failure(FailureKind.CLIENT_ERROR, 404), UpstreamError),
+        # Refusals: a misconfigured provider is the operator's problem (502), a transient one is 503.
+        (failure(FailureKind.REFUSED, 401), UpstreamError),
+        (failure(FailureKind.REFUSED, 403), UpstreamError),
+        (failure(FailureKind.REFUSED, 404), UpstreamError),
+        (failure(FailureKind.REFUSED, 408), UpstreamUnavailableError),
+        (failure(FailureKind.REFUSED, 409), UpstreamUnavailableError),
+        (failure(FailureKind.REFUSED, 425), UpstreamUnavailableError),
     ],
 )
 def test_final_attempt_decides_the_gateway_error(final: AttemptFailure, expected: type) -> None:
@@ -106,6 +118,55 @@ def test_final_attempt_decides_the_gateway_error(final: AttemptFailure, expected
     assert type(error) is expected
     assert error.failures == (earlier, final)
     assert SECRET not in error.message and "Traceback" not in error.message
+
+
+def retry_hint(kind: FailureKind, status: int | None, retry_after: int | None) -> AttemptFailure:
+    return AttemptFailure("primary", kind, status=status, detail=SECRET, retry_after=retry_after)
+
+
+@pytest.mark.parametrize(
+    ("failures", "header"),
+    [
+        # The smallest hint: when the first provider expects to be available again.
+        ([(FailureKind.RATE_LIMITED, 429, 7), (FailureKind.RATE_LIMITED, 429, 3)], "3"),
+        ([(FailureKind.RATE_LIMITED, 429, 7), (FailureKind.SERVER_ERROR, 500, None)], "7"),
+        ([(FailureKind.SERVER_ERROR, 503, 12), (FailureKind.CONNECTION, None, None)], "12"),
+        ([(FailureKind.RATE_LIMITED, 429, None), (FailureKind.RATE_LIMITED, 429, None)], None),
+        # Only a 503 carries it: a final timeout (504) or bad response (502) does not.
+        ([(FailureKind.RATE_LIMITED, 429, 7), (FailureKind.TIMEOUT, None, None)], None),
+        ([(FailureKind.RATE_LIMITED, 429, 7), (FailureKind.BAD_RESPONSE, 200, None)], None),
+    ],
+)
+def test_upstream_retry_after_is_relayed_on_503(failures: list, header: str | None) -> None:
+    error = gateway_error_for([retry_hint(*f) for f in failures])
+    assert error.headers.get("Retry-After") == header
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("7", 7),
+        (" 7 ", 7),
+        ("0", 1),
+        ("1.2", 2),
+        ("3600", 60),
+        ("99999999999", 60),
+        ("Thu, 01 Jan 2026 00:00:30 GMT", 30),
+        ("Thu, 01 Jan 2026 00:00:00 GMT", 1),
+        ("Wed, 31 Dec 2025 23:00:00 GMT", 1),
+        (None, None),
+        ("", None),
+        ("-5", None),
+        ("1e9", None),
+        ("soon", None),
+        ("٣", None),  # a non-ASCII digit
+        ("7; drop table", None),
+        ("Thu, 01 Jan 2026 00:00:30", None),  # no zone: not an HTTP-date
+    ],
+)
+def test_upstream_retry_after_is_sanitized(value: str | None, expected: int | None) -> None:
+    now = 1_767_225_600.0  # 2026-01-01T00:00:00Z
+    assert parse_retry_after(value, now=now) == expected
 
 
 # -- the HTTP layer ------------------------------------------------------------------------------

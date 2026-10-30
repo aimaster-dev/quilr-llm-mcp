@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -9,8 +10,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import anyio
 import httpx
 from starlette.applications import Starlette
+from starlette.types import Message
 
 from llm_router.app import Gateway, create_app
 from llm_router.keys import fingerprint_api_key
@@ -58,16 +61,62 @@ class Harness:
     def gateway(self) -> Gateway:
         return self.app.state.gateway
 
-    async def chat(self, key: str | None = KEY_A, body: Any = None, **kwargs: Any) -> httpx.Response:
+    async def chat(
+        self, key: str | None = KEY_A, body: Any = None, url: str = "/v1/chat/completions", **kwargs: Any
+    ) -> httpx.Response:
         headers = kwargs.pop("headers", {})
         if key is not None:
             headers["Authorization"] = f"Bearer {key}"
         return await self.client.post(
-            "/v1/chat/completions", json=chat_body() if body is None else body, headers=headers, **kwargs
+            url, json=chat_body() if body is None else body, headers=headers, **kwargs
         )
 
     async def usage(self, key: str = KEY_A) -> int:
         return await self.gateway.limiter.usage(fingerprint_api_key(key))
+
+    async def chat_and_hang_up(
+        self, hang_up: anyio.Event, key: str = KEY_A, body: Any = None
+    ) -> list[Message]:
+        """Drive the ASGI app the way a real server does when its client leaves mid-request.
+
+        The whole body is delivered, then ``receive()`` blocks until ``hang_up`` is set and reports
+        ``http.disconnect``. Nothing cancels the app (uvicorn does not either). Returns every
+        message the app sent.
+        """
+        payload = json.dumps(chat_body() if body is None else body).encode()
+        pending: list[Message] = [{"type": "http.request", "body": payload, "more_body": False}]
+        sent: list[Message] = []
+
+        async def receive() -> Message:
+            if pending:
+                return pending.pop(0)
+            await hang_up.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message: Message) -> None:
+            sent.append(message)
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/chat/completions",
+            "raw_path": b"/v1/chat/completions",
+            "root_path": "",
+            "query_string": b"",
+            "headers": [
+                (b"host", b"gateway.test"),
+                (b"authorization", f"Bearer {key}".encode()),
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(payload)).encode()),
+            ],
+            "client": ("127.0.0.1", 50000),
+            "server": ("gateway.test", 80),
+        }
+        await self.app(scope, receive, send)
+        return sent
 
 
 @asynccontextmanager

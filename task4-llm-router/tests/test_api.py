@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from collections import Counter
 from pathlib import Path
@@ -11,6 +12,7 @@ import httpx
 import pytest
 
 from llm_router.keys import fingerprint_api_key
+from llm_router.tokens import estimate_prompt_tokens
 from tests.gateway import COST, KEY_A, KEY_B, PROMPT, chat_body, make_settings, running_gateway
 from tests.helpers import FakeClock
 from tests.upstreams import Recorder, completion_body, ok, respond
@@ -105,6 +107,89 @@ async def test_missing_usage_is_charged_at_the_estimate(tmp_path: Path) -> None:
         assert await gw.usage() == COST
 
 
+# -- reconciling with the provider's usage -------------------------------------------------------
+
+PROMPT_ESTIMATE = 17  # see tests.gateway.PROMPT
+MAX_PLAUSIBLE = (COST - PROMPT_ESTIMATE) + 4 * PROMPT_ESTIMATE  # max_tokens + 4 x prompt estimate
+NO_USAGE = object()
+
+
+def completion_with_usage(usage: object) -> dict:
+    body = completion_body("hi", total_tokens=None)
+    if usage is not NO_USAGE:
+        body["usage"] = usage
+    return body
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        pytest.param({"total_tokens": 2**63}, id="2**63"),
+        pytest.param({"total_tokens": 10**15}, id="10**15"),
+        pytest.param({"total_tokens": MAX_PLAUSIBLE + 1}, id="just-above-possible"),
+        pytest.param({"prompt_tokens": 9, "completion_tokens": 40_000}, id="ignored-max_tokens"),
+        pytest.param({"total_tokens": 0}, id="zero"),
+        pytest.param({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, id="all-zero"),
+        pytest.param({"total_tokens": -5}, id="negative"),
+        pytest.param({"prompt_tokens": 9, "completion_tokens": -1}, id="negative-part"),
+        pytest.param({"total_tokens": "100"}, id="string"),
+        pytest.param({"total_tokens": True}, id="bool"),
+        pytest.param({"prompt_tokens": 9}, id="prompt-only"),
+        pytest.param("n/a", id="not-an-object"),
+        pytest.param(None, id="null"),
+        pytest.param(NO_USAGE, id="missing"),
+    ],
+)
+async def test_implausible_or_missing_usage_keeps_the_reservation_and_still_serves(
+    tmp_path: Path, usage: object
+) -> None:
+    """A broken provider can neither crash the request, lock the tenant out nor make it free."""
+    primary, secondary = Recorder(respond(200, json_body=completion_with_usage(usage))), Recorder(ok())
+    async with running_gateway(make_settings(tmp_path), primary, secondary) as gw:
+        response = await gw.chat()
+        charged = await gw.usage()
+
+    assert response.status_code == 200
+    assert response.headers["x-gateway-route"] == "primary"  # a valid completion is not failed over
+    assert response.json()["choices"][0]["message"]["content"] == "hi"
+    assert "usage" not in response.json()  # numbers the gateway refused to charge are not relayed
+    assert charged == COST
+    assert response.headers["x-ratelimit-remaining"] == str(10_000 - COST)
+    assert secondary.requests == []
+
+
+@pytest.mark.parametrize("total", [1, PROMPT_ESTIMATE, COST - 1, COST + 1, MAX_PLAUSIBLE])
+async def test_plausible_usage_is_recorded_exactly(tmp_path: Path, total: int) -> None:
+    # Above the reservation is possible (the prompt estimate is not an upper bound) and recorded too.
+    async with running_gateway(make_settings(tmp_path), Recorder(ok(total_tokens=total))) as gw:
+        response = await gw.chat()
+        charged = await gw.usage()
+    assert response.status_code == 200
+    assert response.json()["usage"]["total_tokens"] == total
+    assert charged == total
+    assert response.headers["x-ratelimit-remaining"] == str(10_000 - total)
+
+
+async def test_a_failing_reconcile_still_returns_the_completion(
+    tmp_path: Path, monkeypatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="llm_router")
+    async with running_gateway(make_settings(tmp_path), Recorder(ok("served", total_tokens=42))) as gw:
+
+        async def broken(*args: object) -> None:
+            raise OverflowError("Python int too large to convert to SQLite INTEGER")
+
+        monkeypatch.setattr(gw.gateway.limiter, "reconcile", broken)
+        response = await gw.chat()
+        charged = await gw.usage()
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "served"
+    assert charged == COST  # fail safe: the reservation keeps its estimate
+    [record] = [r for r in caplog.records if "could not reconcile" in r.getMessage()]
+    assert record.levelno == logging.ERROR and record.exc_info is not None
+
+
 # -- failover through the API --------------------------------------------------------------------
 
 
@@ -121,6 +206,26 @@ async def test_primary_429_is_served_by_the_fallback(tmp_path: Path) -> None:
     assert secondary.json()["model"] == "backup-model"
     assert secondary.requests[0].headers["authorization"] == "Bearer sk-provider-backup"
     assert usage == 21
+
+
+async def test_a_primary_refusing_the_gateway_key_is_served_by_the_fallback(tmp_path: Path) -> None:
+    primary = Recorder(respond(401, json_body={"error": "invalid api key sk-provider-primary"}))
+    secondary = Recorder(ok("from fallback", total_tokens=21))
+    async with running_gateway(make_settings(tmp_path), primary, secondary) as gw:
+        response = await gw.chat()
+    assert response.status_code == 200
+    assert response.headers["x-gateway-route"] == "fallback"
+
+
+async def test_upstream_retry_after_reaches_the_client_sanitized(tmp_path: Path) -> None:
+    primary = Recorder(respond(429, json_body={"error": "busy"}, headers={"Retry-After": "7"}))
+    secondary = Recorder(respond(429, json_body={"error": "busy"}, headers={"Retry-After": "2"}))
+    async with running_gateway(make_settings(tmp_path), primary, secondary) as gw:
+        response = await gw.chat()
+    assert response.status_code == 503
+    assert error_of(response)["code"] == "upstream_unavailable"
+    assert response.headers["retry-after"] == "2"
+    assert response.headers["x-ratelimit-remaining"] == "10000"  # released
 
 
 async def test_timeout_race_fails_over_at_the_deadline_and_counts_only_the_fallback(tmp_path: Path) -> None:
@@ -166,7 +271,41 @@ async def test_failed_requests_release_their_reservation(
     assert response.headers["x-ratelimit-remaining"] == "10000"
 
 
-async def test_cancelled_request_releases_its_reservation(tmp_path: Path) -> None:
+async def test_client_disconnect_cancels_routing_and_releases_the_reservation(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The server reports http.disconnect but does not cancel the handler (as uvicorn does)."""
+    caplog.set_level(logging.INFO, logger="llm_router")
+    settings = make_settings(tmp_path, primary_timeout=5.0)
+    primary, secondary = Recorder(ok(delay=30)), Recorder(ok())
+    sent: list = []
+    async with running_gateway(settings, primary, secondary) as gw:
+        hang_up = anyio.Event()
+
+        async def client() -> None:
+            sent.extend(await gw.chat_and_hang_up(hang_up))
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(client)
+            with anyio.fail_after(2):
+                while not primary.requests:
+                    await anyio.sleep(0.01)
+            hung_up_at = anyio.current_time()
+            hang_up.set()
+        handler_returned_after = anyio.current_time() - hung_up_at
+        usage = await gw.usage()
+
+    assert handler_returned_after < 1.0  # not the 5 s primary deadline
+    assert (primary.cancelled, primary.completed) == (1, 0)
+    assert secondary.requests == []  # a client that has gone is not failed over
+    assert usage == 0
+    assert sent == []  # nobody to answer: nothing is sent
+    [record] = [r for r in caplog.records if "client disconnected" in r.getMessage()]
+    assert record.levelno == logging.INFO
+
+
+async def test_outer_cancellation_releases_the_reservation(tmp_path: Path) -> None:
+    """Cancellation from outside the handler (server shutdown) also releases the reservation."""
     settings = make_settings(tmp_path, primary_timeout=5.0)
     primary = Recorder(ok(delay=30))
     async with running_gateway(settings, primary) as gw:
@@ -246,6 +385,35 @@ async def test_limiter_database_failure_fails_closed(tmp_path: Path, monkeypatch
     assert primary.requests == []
 
 
+async def test_a_locked_database_gives_every_caller_a_quick_503(tmp_path: Path) -> None:
+    """Another process holds the write lock: callers get 503s promptly, not one per busy timeout."""
+    busy, parallel = 0.25, 8
+    primary = Recorder(ok())
+    settings = make_settings(tmp_path, db_busy_timeout=busy, db_fail_fast=1.0)
+    async with running_gateway(settings, primary) as gw:
+        blocker = sqlite3.connect(settings.db_path, isolation_level=None)
+        try:
+            blocker.execute("BEGIN EXCLUSIVE")
+            responses: list[httpx.Response] = []
+
+            async def one() -> None:
+                responses.append(await gw.chat())
+
+            started = anyio.current_time()
+            async with anyio.create_task_group() as tg:
+                for _ in range(parallel):
+                    tg.start_soon(one)
+            elapsed = anyio.current_time() - started
+        finally:
+            blocker.execute("ROLLBACK")
+            blocker.close()
+
+    assert [r.status_code for r in responses] == [503] * parallel
+    assert {error_of(r)["code"] for r in responses} == {"rate_limiter_unavailable"}
+    assert elapsed < busy + 0.5  # was parallel x busy (2 s) before the fail-fast window
+    assert primary.requests == []
+
+
 async def test_raw_tenant_keys_never_reach_the_database(tmp_path: Path) -> None:
     async with running_gateway(make_settings(tmp_path), Recorder(ok())) as gw:
         assert (await gw.chat(KEY_A)).status_code == 200
@@ -258,6 +426,7 @@ async def test_raw_tenant_keys_never_reach_the_database(tmp_path: Path) -> None:
 # -- validation ----------------------------------------------------------------------------------
 
 SECRET_INPUT = "SECRET-INPUT-VALUE-4242"
+TOOL_CALL = {"id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": '{"q":"x"}'}}
 
 
 @pytest.mark.parametrize(
@@ -268,12 +437,25 @@ SECRET_INPUT = "SECRET-INPUT-VALUE-4242"
         ({"model": "m"}, "invalid_request", "messages"),
         ({"messages": []}, "invalid_request", "messages"),
         ({"messages": SECRET_INPUT}, "invalid_request", "messages"),
-        ({**chat_body(), "frequency_penalty": 1}, "invalid_request", "frequency_penalty"),
+        ({**chat_body(), "logit_bias": {"42": 1}}, "invalid_request", "logit_bias: is not supported"),
+        ({**chat_body(), "tools": []}, "invalid_request", "tools: is not supported"),
         ({**chat_body(), "max_tokens": 0}, "invalid_request", "max_tokens"),
         ({**chat_body(), "max_tokens": "100"}, "invalid_request", "max_tokens"),
+        ({**chat_body(), "max_completion_tokens": 40_000}, "invalid_request", "max_completion_tokens"),
+        ({**chat_body(), "max_completion_tokens": 50}, "invalid_request", "max_completion_tokens disagree"),
+        ({**chat_body(), "n": 2}, "invalid_request", "n > 1 is not supported"),
         ({**chat_body(), "temperature": 5}, "invalid_request", "temperature"),
-        ({"messages": [{"role": "tool", "content": SECRET_INPUT}]}, "invalid_request", "role"),
-        ({"messages": [{"role": "user", "content": 42}]}, "invalid_request", "content"),
+        ({**chat_body(), "presence_penalty": 3}, "invalid_request", "presence_penalty"),
+        ({"messages": [{"role": "robot", "content": SECRET_INPUT}]}, "invalid_request", "role"),
+        ({"messages": [{"role": "user", "content": 42}]}, "invalid_request", "messages.0.content:"),
+        ({"messages": [{"role": "user", "content": None}]}, "invalid_request", "content is required"),
+        ({"messages": [{"role": "user"}]}, "invalid_request", "content is required"),
+        ({"messages": [{"role": "tool", "content": SECRET_INPUT}]}, "invalid_request", "tool_call_id"),
+        (
+            {"messages": [{"role": "user", "content": "x", "tool_calls": [TOOL_CALL]}]},
+            "invalid_request",
+            "only assistant messages can have tool_calls",
+        ),
         ({**chat_body(), "stream": True}, "streaming_not_supported", "stream"),
     ],
 )
@@ -300,6 +482,119 @@ async def test_invalid_requests_are_rejected_without_echoing_input(
     assert usage == 0
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param({"messages": [{"role": "user", "content": 42}]}, id="content-type"),
+        pytest.param({"messages": [{"role": "user", "content": [{"type": "image"}]}]}, id="content-part"),
+        pytest.param({**chat_body(), "stop": 5}, id="stop"),
+    ],
+)
+async def test_validation_errors_name_fields_not_pydantic_internals(tmp_path: Path, body: dict) -> None:
+    async with running_gateway(make_settings(tmp_path), Recorder(ok())) as gw:
+        response = await gw.chat(body=body)
+    message = error_of(response)["message"]
+    for internal in ("listTextPart", "list[", "TextPart", ".str:", "liststr", "Value error"):
+        assert internal not in message
+    assert message.startswith("Invalid request body: ")
+
+
+async def test_openai_sdk_fields_are_accepted_and_forwarded(tmp_path: Path) -> None:
+    primary = Recorder(ok(total_tokens=COST))
+    body = chat_body(
+        max_tokens=None,
+        max_completion_tokens=83,  # the current OpenAI name: charged like max_tokens
+        n=1,
+        user="end-user-17",
+        top_p=0.9,
+        presence_penalty=0.5,
+        frequency_penalty=-0.5,
+        seed=1234,
+    )
+    async with running_gateway(make_settings(tmp_path), primary) as gw:
+        response = await gw.chat(body=body)
+        charged = await gw.usage()
+
+    assert response.status_code == 200
+    sent = primary.json()
+    assert sent["max_tokens"] == 83 and "max_completion_tokens" not in sent
+    assert "n" not in sent
+    for field in ("user", "top_p", "presence_penalty", "frequency_penalty", "seed"):
+        assert sent[field] == body[field]
+    assert charged == COST
+
+
+async def test_max_tokens_and_max_completion_tokens_may_agree(tmp_path: Path) -> None:
+    primary = Recorder(ok(total_tokens=COST))
+    async with running_gateway(make_settings(tmp_path), primary) as gw:
+        response = await gw.chat(body=chat_body(max_completion_tokens=COST - 17))
+    assert response.status_code == 200
+    assert primary.json()["max_tokens"] == COST - 17
+
+
+async def test_tool_call_histories_are_accepted_and_counted(tmp_path: Path) -> None:
+    primary = Recorder(ok(total_tokens=None))
+    messages = [
+        {"role": "user", "content": "What is x?"},
+        {"role": "assistant", "content": None, "tool_calls": [TOOL_CALL]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "x is 42"},
+    ]
+    async with running_gateway(make_settings(tmp_path), primary) as gw:
+        response = await gw.chat(body={"messages": messages, "max_tokens": 10})
+        charged = await gw.usage()
+
+    assert response.status_code == 200
+    forwarded = primary.json()["messages"]
+    assert forwarded == [
+        {"role": "user", "content": "What is x?"},
+        {"role": "assistant", "tool_calls": [TOOL_CALL]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "x is 42"},
+    ]
+    # No usage reported, so the reservation stands: the tool call and its id are part of it.
+    assert charged == estimate_prompt_tokens(forwarded) + 10
+    without_tools = [{"role": m["role"], "content": m.get("content") or ""} for m in forwarded]
+    assert estimate_prompt_tokens(forwarded) > estimate_prompt_tokens(without_tools)
+
+
+async def test_a_client_that_hangs_up_mid_body_gets_no_500(tmp_path: Path, caplog) -> None:
+    caplog.set_level(logging.INFO)
+    primary = Recorder(ok())
+    async with running_gateway(make_settings(tmp_path), primary) as gw:
+        messages = [
+            {"type": "http.request", "body": b'{"messages":', "more_body": True},
+            {"type": "http.disconnect"},
+        ]
+        sent: list = []
+
+        async def receive() -> dict:
+            return messages.pop(0)
+
+        async def send(message: dict) -> None:
+            sent.append(message)
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/chat/completions",
+            "raw_path": b"/v1/chat/completions",
+            "root_path": "",
+            "query_string": b"",
+            "headers": [(b"authorization", f"Bearer {KEY_A}".encode()), (b"content-length", b"1000")],
+            "client": ("127.0.0.1", 50000),
+            "server": ("gateway.test", 80),
+        }
+        await gw.app(scope, receive, send)
+
+    assert sent == []  # nothing written to a closed connection
+    assert primary.requests == []
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    [record] = [r for r in caplog.records if "before sending the whole request body" in r.getMessage()]
+    assert record.levelno == logging.INFO
+
+
 async def test_oversized_bodies_are_rejected(tmp_path: Path) -> None:
     primary = Recorder(ok())
     async with running_gateway(make_settings(tmp_path, max_body_bytes=2048), primary) as gw:
@@ -315,9 +610,13 @@ async def test_other_routes_use_the_standard_error_shape(tmp_path: Path) -> None
         health = await gw.client.get("/healthz")
         missing = await gw.client.get("/v1/models")
         wrong_method = await gw.client.get("/v1/chat/completions")
+        trailing_slash = await gw.chat(url="/v1/chat/completions/")
     assert health.json() == {"status": "ok"}
     assert error_of(missing)["code"] == "not_found"
     assert error_of(wrong_method)["code"] == "method_not_allowed"
+    # Not an empty-bodied 307 redirect: the standard JSON 404.
+    assert trailing_slash.status_code == 404
+    assert error_of(trailing_slash)["code"] == "not_found"
 
 
 # -- concurrency ---------------------------------------------------------------------------------

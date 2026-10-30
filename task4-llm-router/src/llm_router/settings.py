@@ -7,14 +7,23 @@ tenant keys) are read from the environment only, so they never appear in process
 from __future__ import annotations
 
 import argparse
+import math
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from llm_router.keys import TenantKeyring, fingerprint_api_key
-from llm_router.limiter import DEFAULT_TOKENS_PER_WINDOW, DEFAULT_WINDOW_SECONDS
+from llm_router.limiter import (
+    DEFAULT_BUSY_TIMEOUT_MS,
+    DEFAULT_FAIL_FAST_SECONDS,
+    DEFAULT_TOKENS_PER_WINDOW,
+    DEFAULT_WINDOW_SECONDS,
+    TokenRateLimiter,
+)
 from llm_router.router import (
+    DEFAULT_MAX_RESPONSE_BYTES,
     DEFAULT_PRIMARY_TIMEOUT_SECONDS,
     DEFAULT_SECONDARY_TIMEOUT_SECONDS,
     FailoverPolicy,
@@ -25,6 +34,7 @@ from llm_router.schemas import MAX_TOKENS_LIMIT
 ENV_PREFIX = "LLM_ROUTER_"
 PRIMARY_LABEL = "primary"
 SECONDARY_LABEL = "fallback"
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 
 
 @dataclass(frozen=True)
@@ -41,7 +51,13 @@ class Settings:
     secondary_timeout: float = DEFAULT_SECONDARY_TIMEOUT_SECONDS
     failover_on_connection_error: bool = True
     failover_on_server_error: bool = True
+    failover_on_refused: bool = True
+    max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES
     db_path: Path = Path("data/llm_router.db")
+    #: Seconds a limiter transaction waits for SQLite's write lock.
+    db_busy_timeout: float = DEFAULT_BUSY_TIMEOUT_MS / 1000
+    #: Seconds every limiter call fails fast (503) after a database error.
+    db_fail_fast: float = DEFAULT_FAIL_FAST_SECONDS
     tokens_per_window: int = DEFAULT_TOKENS_PER_WINDOW
     window_seconds: float = DEFAULT_WINDOW_SECONDS
     sweep_interval: float = 30.0
@@ -57,15 +73,26 @@ class Settings:
             raise ValueError("a primary upstream URL and model are required")
         if bool(self.secondary_url) != bool(self.secondary_model):
             raise ValueError("set both the secondary upstream URL and model, or neither")
+        # math.isfinite: nan compares false with everything, so "nan <= 0" would let it through
+        # (and move_on_after(nan) never fires: the 3000 ms deadline would silently disappear).
         for name in ("primary_timeout", "secondary_timeout", "window_seconds", "sweep_interval"):
-            if getattr(self, name) <= 0:
-                raise ValueError(f"{name} must be positive")
+            value = getattr(self, name)
+            if not (math.isfinite(value) and value > 0):
+                raise ValueError(f"{name} must be a positive, finite number")
+        for name in ("db_busy_timeout", "db_fail_fast"):
+            value = getattr(self, name)
+            if not (math.isfinite(value) and value >= 0):
+                raise ValueError(f"{name} must be a finite number, not negative")
+        if self.log_level not in LOG_LEVELS:
+            raise ValueError(f"log_level must be one of {', '.join(LOG_LEVELS)}")
         if self.tokens_per_window < 1:
             raise ValueError("tokens_per_window must be at least 1")
         if not 1 <= self.default_max_tokens <= MAX_TOKENS_LIMIT:
             raise ValueError(f"default_max_tokens must be between 1 and {MAX_TOKENS_LIMIT}")
         if self.max_body_bytes < 1024:
             raise ValueError("max_body_bytes must be at least 1024")
+        if self.max_response_bytes < 1024:
+            raise ValueError("max_response_bytes must be at least 1024")
         if self.workers < 1:
             raise ValueError("workers must be at least 1")
         TenantKeyring(self.tenant_key_fingerprints)  # validates the fingerprints
@@ -86,10 +113,21 @@ class Settings:
             self.secondary_api_key,
         )
 
+    def open_limiter(self, clock: Callable[[], float] = time.time) -> TokenRateLimiter:
+        """Open (creating if needed) the limiter database described by these settings."""
+        return TokenRateLimiter(
+            self.db_path,
+            limit_tokens=self.tokens_per_window,
+            window_seconds=self.window_seconds,
+            clock=clock,
+            busy_timeout_ms=round(self.db_busy_timeout * 1000),
+        )
+
     def failover_policy(self) -> FailoverPolicy:
         return FailoverPolicy(
             on_connection_error=self.failover_on_connection_error,
             on_server_error=self.failover_on_server_error,
+            on_refused=self.failover_on_refused,
         )
 
     def to_env(self) -> dict[str, str]:
@@ -129,6 +167,7 @@ class _Option:
     help: str
     to_env: Callable[[Any], str] = str
     boolean: bool = False
+    choices: tuple[str, ...] | None = None
 
     @property
     def env(self) -> str:
@@ -144,6 +183,20 @@ _OPTIONS = (
     _Option("--port", "port", int, "port to listen on (default 8080)"),
     _Option("--workers", "workers", int, "server worker processes sharing the limiter database (default 1)"),
     _Option("--db-path", "db_path", Path, "SQLite database file (default data/llm_router.db)"),
+    _Option(
+        "--db-busy-timeout-ms",
+        "db_busy_timeout",
+        _ms_to_seconds,
+        "how long a limiter transaction waits for the SQLite write lock (default 1000)",
+        to_env=_seconds_to_ms,
+    ),
+    _Option(
+        "--db-fail-fast-ms",
+        "db_fail_fast",
+        _ms_to_seconds,
+        "after a limiter database error, answer 503 at once for this long (default 1000; 0 disables)",
+        to_env=_seconds_to_ms,
+    ),
     _Option("--tokens-per-window", "tokens_per_window", int, "token budget per tenant (default 50000)"),
     _Option("--window-seconds", "window_seconds", float, "sliding window length (default 60)"),
     _Option("--sweep-interval", "sweep_interval", float, "seconds between expired-row sweeps (default 30)"),
@@ -188,7 +241,28 @@ _OPTIONS = (
         to_env=lambda v: "true" if v else "false",
         boolean=True,
     ),
-    _Option("--log-level", "log_level", str, "DEBUG, INFO, WARNING or ERROR (default INFO)"),
+    _Option(
+        "--failover-on-refused",
+        "failover_on_refused",
+        _parse_bool,
+        "fail over when the primary refuses with a 4xx other than 400/413/422/429, e.g. 401, 403, "
+        "404, 408 (default on)",
+        to_env=lambda v: "true" if v else "false",
+        boolean=True,
+    ),
+    _Option(
+        "--max-response-bytes",
+        "max_response_bytes",
+        int,
+        "largest provider response body read; bigger is a bad response (default 4 MiB)",
+    ),
+    _Option(
+        "--log-level",
+        "log_level",
+        lambda value: value.strip().upper(),
+        f"one of {', '.join(LOG_LEVELS)}, case-insensitive (default INFO)",
+        choices=LOG_LEVELS,
+    ),
 )
 
 
@@ -212,7 +286,12 @@ def build_parser(prog: str = "llm-router") -> argparse.ArgumentParser:
         else:
             metavar = option.flag.removeprefix("--").replace("-", "_").upper()
             parser.add_argument(
-                option.flag, dest=option.attr, type=option.parse, metavar=metavar, help=help_text
+                option.flag,
+                dest=option.attr,
+                type=option.parse,
+                choices=option.choices,
+                metavar=metavar,
+                help=help_text,
             )
     return parser
 
@@ -233,6 +312,11 @@ def load_settings(argv: Sequence[str] | None, environ: Mapping[str, str]) -> Set
                 value = option.parse(environ[option.env])
             except (ValueError, argparse.ArgumentTypeError) as exc:
                 parser.error(f"{option.env}: {exc}")
+            if option.choices and value not in option.choices:
+                parser.error(
+                    f"{option.env}: invalid choice {environ[option.env]!r} "
+                    f"(choose from {', '.join(option.choices)})"
+                )
         if value is not None:
             values[option.attr] = value
 

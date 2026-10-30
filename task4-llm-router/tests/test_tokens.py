@@ -6,8 +6,10 @@ from llm_router.keys import TenantKeyring, fingerprint_api_key, is_fingerprint
 from llm_router.tokens import (
     MESSAGE_OVERHEAD_TOKENS,
     REPLY_PRIMING_TOKENS,
+    accepted_usage,
     estimate_prompt_tokens,
     estimate_text_tokens,
+    max_plausible_usage,
     request_cost,
 )
 
@@ -40,6 +42,24 @@ def test_request_cost_adds_the_completion_budget() -> None:
     assert request_cost(120, 256) == 376
     with pytest.raises(ValueError):
         request_cost(-1, 10)
+
+
+def test_plausible_usage_range() -> None:
+    # max_tokens 500, prompt estimate 9: the provider cannot exceed 500 completion tokens, and the
+    # prompt cannot be more than one token per byte, i.e. 4x its bytes/4 estimate.
+    assert max_plausible_usage(9, 500) == 536
+    for reported in (1, 9, 509, 536):
+        assert accepted_usage(reported, prompt_tokens=9, max_tokens=500) == reported
+    for reported in (None, 0, -1, 537, 10**15, 2**63):
+        assert accepted_usage(reported, prompt_tokens=9, max_tokens=500) is None
+
+
+def test_the_ceiling_covers_one_token_per_byte() -> None:
+    # The worst case for a byte-level tokenizer: every byte its own token.
+    for text in ("a a a a a a a a", "日本語のテキスト", "😀😀😀", "x" * 1001):
+        prompt = estimate_prompt_tokens([{"role": "user", "content": text}])
+        worst_case = len(text.encode()) + MESSAGE_OVERHEAD_TOKENS + REPLY_PRIMING_TOKENS
+        assert accepted_usage(worst_case + 16, prompt_tokens=prompt, max_tokens=16) is not None
 
 
 def test_fingerprints() -> None:
