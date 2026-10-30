@@ -15,6 +15,7 @@ from mcp_gateway.config import (
     DEFAULT_JWT_AUDIENCE,
     DEFAULT_JWT_ISSUER,
     DEFAULT_MAX_BODY_BYTES,
+    DEFAULT_MAX_STREAMS_PER_SUBJECT,
     JWT_SECRET_ENV,
     ConfigError,
     GatewaySettings,
@@ -66,6 +67,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="largest accepted request body (default: %(default)s)",
     )
     parser.add_argument(
+        "--max-streams-per-subject",
+        type=int,
+        default=_env("MAX_STREAMS_PER_SUBJECT", str(DEFAULT_MAX_STREAMS_PER_SUBJECT)),
+        help="concurrent GET (SSE) streams one token subject may hold open (default: %(default)s)",
+    )
+    parser.add_argument(
         "--jwt-issuer",
         default=_env("JWT_ISSUER", DEFAULT_JWT_ISSUER),
         help="required `iss` claim (default: %(default)s)",
@@ -102,6 +109,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             connect_timeout=args.connect_timeout,
             read_timeout=args.read_timeout,
             max_body_bytes=args.max_body_bytes,
+            max_streams_per_subject=args.max_streams_per_subject,
         )
     except ConfigError as exc:
         parser.error(str(exc))

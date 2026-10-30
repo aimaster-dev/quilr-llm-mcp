@@ -8,6 +8,10 @@ The gateway exposes one endpoint, `/mcp`, and relays it to one downstream URL:
 
 Every request is authenticated first. A POST body is then parsed, checked against the policy, and
 either answered by the gateway (error or denial) or forwarded in canonical form.
+
+Downstream connections come from two pools. GET streams are open-ended (no read timeout), so they
+get their own pool and a per-subject cap: however many a caller opens, they cannot take the
+connections that POST and DELETE need.
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ import logging
 import re
 import uuid
 from collections.abc import AsyncIterator, Iterable
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 
 import anyio
@@ -35,7 +39,9 @@ from mcp_gateway.jsonrpc import (
     AUTHENTICATION_FAILED,
     DOWNSTREAM_TIMEOUT,
     DOWNSTREAM_UNAVAILABLE,
+    GATEWAY_BUSY,
     INVALID_REQUEST,
+    TOO_MANY_STREAMS,
     UNAUTHORIZED_TOOL_CALL,
     JsonRpcError,
     RequestId,
@@ -95,6 +101,42 @@ DROPPED_REQUEST_PREFIXES = (IDENTITY_HEADER_PREFIX, "x-forwarded-")
 DROPPED_RESPONSE_HEADERS = HOP_BY_HOP_HEADERS | {"date", "server"}
 
 _CONTENT_LENGTH = re.compile(r"[0-9]{1,19}")
+
+# Request/response traffic (POST, DELETE): httpx's usual limits. A request waits at most
+# `connect_timeout` for a free connection, then gets 503 "gateway busy".
+REQUEST_POOL_LIMITS = httpx.Limits(max_connections=100, max_keepalive_connections=20)
+# GET streams: unbounded here, bounded per subject by `StreamSlots` instead, so a stream never waits
+# for a connection and never holds one that a request needs.
+STREAM_POOL_LIMITS = httpx.Limits(max_connections=None, max_keepalive_connections=20)
+
+
+class StreamSlots:
+    """How many GET streams each token subject has open, against a fixed per-subject cap.
+
+    The gateway runs on one event loop and nothing awaits between the check and the increment,
+    so no lock is needed.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self._open: dict[str, int] = {}
+
+    def acquire(self, subject: str) -> bool:
+        count = self._open.get(subject, 0)
+        if count >= self.limit:
+            return False
+        self._open[subject] = count + 1
+        return True
+
+    def release(self, subject: str) -> None:
+        count = self._open[subject] - 1
+        if count:
+            self._open[subject] = count
+        else:
+            del self._open[subject]
+
+    def open_streams(self, subject: str) -> int:
+        return self._open.get(subject, 0)
 
 
 def header_key(name: str | bytes) -> str:
@@ -251,9 +293,13 @@ class Admitted:
 class Gateway:
     """The `/mcp` endpoint (an ASGI app): authenticates, validates, authorizes, forwards."""
 
-    def __init__(self, settings: GatewaySettings, client: httpx.AsyncClient) -> None:
+    def __init__(
+        self, settings: GatewaySettings, client: httpx.AsyncClient, stream_client: httpx.AsyncClient
+    ) -> None:
         self.settings = settings
-        self._client = client
+        self._client = client  # POST and DELETE
+        self._stream_client = stream_client  # GET streams, a separate connection pool
+        self.streams = StreamSlots(settings.max_streams_per_subject)
         self._verifier = TokenVerifier(
             secret=settings.jwt_secret,
             issuer=settings.jwt_issuer,
@@ -268,16 +314,21 @@ class Gateway:
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         # A plain ASGI app rather than a Starlette endpoint, so every HTTP method reaches `handle`
         # and gets a JSON-RPC shaped 405 instead of Starlette's plain-text one.
-        response = await self.handle(Request(scope, receive))
-        await response(scope, receive, send)
+        async with AsyncExitStack() as on_finish:  # released once the response is fully relayed
+            response = await self.handle(Request(scope, receive), on_finish)
+            await response(scope, receive, send)
 
-    async def handle(self, request: Request) -> Response:
-        """Admit or refuse the request (one audit line either way), then forward it."""
+    async def handle(self, request: Request, on_finish: AsyncExitStack) -> Response:
+        """Admit or refuse the request (one audit line either way), then forward it.
+
+        Resources the request holds until its response has been relayed (a stream slot) are
+        registered on `on_finish`.
+        """
         record = AuditRecord(request_id=uuid.uuid4().hex, http_method=request.method)
         try:
             identity = self.authenticate(request)
             record.subject, record.role = identity.subject, identity.role.value
-            admitted = await self._admit(request, identity.role, record)
+            admitted = await self._admit(request, identity, record, on_finish)
         except JsonRpcError as error:
             verdict = "deny" if error.code == UNAUTHORIZED_TOOL_CALL else "reject"
             record.emit(verdict, error.detail or error.message, status=error.http_status, code=error.code)
@@ -302,8 +353,21 @@ class Gateway:
                 detail=f"authentication failed: {exc.reason}",
             ) from exc
 
-    async def _admit(self, request: Request, role: Role, record: AuditRecord) -> Admitted:
+    async def _admit(
+        self, request: Request, identity: Identity, record: AuditRecord, on_finish: AsyncExitStack
+    ) -> Admitted:
         """Validate the request and apply the policy. Raises `JsonRpcError` to refuse it."""
+        if request.method == "GET":
+            # An open-ended stream: cap how many one subject may hold, so a single token cannot
+            # pile up idle streams.
+            if not self.streams.acquire(identity.subject):
+                raise JsonRpcError(
+                    TOO_MANY_STREAMS,
+                    "Too many open streams: close one before opening another",
+                    http_status=429,
+                    detail=f"stream_limit_exceeded ({self.streams.limit} open)",
+                )
+            on_finish.callback(self.streams.release, identity.subject)
         if request.method in _BODYLESS_REASONS:  # no JSON-RPC message, nothing to authorize
             return Admitted(content=None, rpc_id=None, reason=_BODYLESS_REASONS[request.method])
         if request.method != "POST":
@@ -320,7 +384,7 @@ class Gateway:
         headers = [(name.decode("latin-1"), value.decode("latin-1")) for name, value in request.headers.raw]
         check_routing_headers(message, headers)
 
-        decision = authorize(message, role)
+        decision = authorize(message, identity.role)
         record.tool = decision.tool
         rpc_id = message.id if message.method is not None else None  # a client response is not a request
         if not decision.allowed:
@@ -342,7 +406,7 @@ class Gateway:
     async def forward(
         self, request: Request, identity: Identity, request_id: str, admitted: Admitted
     ) -> Response:
-        """Send the request downstream and relay the response; transport failures become 502/504."""
+        """Send the request downstream and relay the response; transport failures become 502/503/504."""
         rpc_id = admitted.rpc_id
         headers = request_headers_to_forward(request.headers.raw)
         headers += [
@@ -351,15 +415,25 @@ class Gateway:
             (ROLE_HEADER.encode(), identity.role.value.encode()),
             (REQUEST_ID_HEADER.encode(), request_id.encode()),
         ]
-        upstream_request = self._client.build_request(
+        # POST responses may be SSE too, but each ends once the downstream has answered, and the
+        # read timeout bounds silence on it. Only GET streams are open-ended.
+        is_stream = request.method == "GET"
+        client = self._stream_client if is_stream else self._client
+        upstream_request = client.build_request(
             request.method,
             self.settings.downstream_url,
             headers=headers,
             content=admitted.content,  # httpx sets Content-Length from these bytes
-            timeout=self._stream_timeout if request.method == "GET" else self._timeout,
+            timeout=self._stream_timeout if is_stream else self._timeout,
         )
         try:
-            upstream = await self._client.send(upstream_request, stream=True)
+            upstream = await client.send(upstream_request, stream=True)
+        except httpx.PoolTimeout as exc:
+            # Every pooled connection is busy. Not the downstream's fault: say so, and say retry.
+            logger.warning("downstream %s waited too long for a pooled connection: %r", request.method, exc)
+            raise JsonRpcError(
+                GATEWAY_BUSY, "Gateway busy: too many concurrent requests", http_status=503, rpc_id=rpc_id
+            ) from exc
         except httpx.TimeoutException as exc:
             logger.warning("downstream %s timed out: %r", request.method, exc)
             raise JsonRpcError(
@@ -376,17 +450,19 @@ class Gateway:
 
 def create_app(settings: GatewaySettings, *, transport: httpx.AsyncBaseTransport | None = None) -> Starlette:
     """Build the gateway ASGI app. `transport` replaces the network (tests pass a mock downstream)."""
-    # trust_env=False: HTTP(S)_PROXY and netrc from the environment must not reroute or add
-    # credentials to downstream traffic.
-    client = httpx.AsyncClient(transport=transport, trust_env=False, follow_redirects=False)
-    gateway = Gateway(settings, client)
+
+    def downstream_client(limits: httpx.Limits) -> httpx.AsyncClient:
+        # trust_env=False: HTTP(S)_PROXY and netrc from the environment must not reroute or add
+        # credentials to downstream traffic. (`limits` only apply to httpx's network transport.)
+        return httpx.AsyncClient(transport=transport, limits=limits, trust_env=False, follow_redirects=False)
+
+    client, stream_client = downstream_client(REQUEST_POOL_LIMITS), downstream_client(STREAM_POOL_LIMITS)
+    gateway = Gateway(settings, client, stream_client)
 
     @asynccontextmanager
     async def lifespan(_app: Starlette) -> AsyncIterator[None]:
-        try:
+        async with client, stream_client:  # closed on shutdown
             yield
-        finally:
-            await client.aclose()
 
     app = Starlette(routes=[Route(MCP_PATH, gateway)], lifespan=lifespan)
     app.state.gateway = gateway

@@ -32,7 +32,7 @@ pytestmark = pytest.mark.anyio
 PING = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
 EVENT_1 = b'event: message\ndata: {"jsonrpc":"2.0","method":"notifications/progress"}\n\n'
 EVENT_2 = b'event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{}}\n\n'
-GATEWAY_ERROR_CODES = {502: -32004, 504: -32005}
+GATEWAY_ERROR_CODES = {502: -32004, 503: -32006, 504: -32005}
 
 
 async def post(client: httpx.AsyncClient, payload: Any, **headers: str) -> httpx.Response:
@@ -388,6 +388,8 @@ async def test_other_http_methods_are_rejected(
         (httpx.RemoteProtocolError("malformed status line"), 502),
         (httpx.ConnectTimeout("connect timed out"), 504),
         (httpx.ReadTimeout("read timed out"), 504),
+        # Every pooled connection is busy: the gateway's limit, not a slow downstream.
+        (httpx.PoolTimeout("no free connection in the pool"), 503),
     ],
 )
 async def test_downstream_failures_become_gateway_errors(

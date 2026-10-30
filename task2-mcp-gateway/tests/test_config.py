@@ -28,6 +28,7 @@ from .helpers import TEST_SECRET
         {"read_timeout": -1},
         {"read_timeout": float("inf")},
         {"max_body_bytes": 0},
+        {"max_streams_per_subject": 0},
     ],
 )
 def test_invalid_settings_are_rejected(overrides: dict[str, Any]) -> None:
@@ -39,6 +40,7 @@ def test_defaults_are_valid() -> None:
     settings = GatewaySettings(jwt_secret=TEST_SECRET)
     assert settings.downstream_url == "http://127.0.0.1:9000/mcp"
     assert settings.max_body_bytes == 1024 * 1024
+    assert settings.max_streams_per_subject == 10
 
 
 def test_secret_is_kept_out_of_repr() -> None:

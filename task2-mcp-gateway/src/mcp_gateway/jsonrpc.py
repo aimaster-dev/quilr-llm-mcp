@@ -27,6 +27,8 @@ UNAUTHORIZED_TOOL_CALL = -32001
 AUTHENTICATION_FAILED = -32003
 DOWNSTREAM_UNAVAILABLE = -32004
 DOWNSTREAM_TIMEOUT = -32005
+GATEWAY_BUSY = -32006  # every pooled downstream connection is in use (HTTP 503)
+TOO_MANY_STREAMS = -32007  # the caller already holds its maximum of open GET streams (HTTP 429)
 
 # MCP 2026-07-28: the HTTP routing headers disagree with the body.
 HEADER_MISMATCH = -32020

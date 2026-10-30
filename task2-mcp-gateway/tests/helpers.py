@@ -133,9 +133,11 @@ async def gateway_client(
         yield client
 
 
-def asgi_scope(method: str, headers: list[tuple[bytes, bytes]], role: Role = Role.VIEWER) -> dict[str, Any]:
+def asgi_scope(
+    method: str, headers: list[tuple[bytes, bytes]], role: Role = Role.VIEWER, subject: str = "alice"
+) -> dict[str, Any]:
     """A raw ASGI HTTP scope for `/mcp`, for tests that drive the app message by message."""
-    authorization = (b"authorization", f"Bearer {token_for(role)}".encode())
+    authorization = (b"authorization", f"Bearer {token_for(role, subject)}".encode())
     return {
         "type": "http",
         "asgi": {"version": "3.0", "spec_version": "2.4"},
