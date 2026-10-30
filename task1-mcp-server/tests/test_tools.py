@@ -57,6 +57,8 @@ async def test_lists_both_tools_with_strict_schemas(client: Client) -> None:
     lookup = tools["get_customer_record"]
     assert lookup.annotations is not None
     assert lookup.annotations.read_only_hint is True
+    # Both work on the same in-memory store, so they describe the same (closed) world.
+    assert lookup.annotations.open_world_hint is refund.annotations.open_world_hint is False
 
 
 async def test_get_customer_record(client: Client) -> None:

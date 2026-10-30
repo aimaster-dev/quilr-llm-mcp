@@ -13,21 +13,54 @@ customer-mcp --log-level DEBUG        # or: python -m customer_mcp
 The process reads JSON-RPC from stdin and writes JSON-RPC to stdout, one message per line.
 **Logs go to stderr only.**
 
+`--log-level` takes `DEBUG`, `INFO`, `WARNING` or `ERROR` (case-insensitive); anything else is a
+usage error (exit code 2). Without the option the level comes from `CUSTOMER_MCP_LOG_LEVEL`. An
+invalid value there is reported on stderr and replaced by `INFO`, because a typo in a host's
+configuration should not stop the server from starting.
+
 Closing stdin ends the session, but not before every request already read has been answered: a
 client may write its whole session and close stdin (`customer-mcp < requests.jsonl`) and still get
 every reply. The server waits up to 30 seconds for in-flight requests, logs a warning on stderr if
 any are still running, then shuts down (those get a `Connection closed` error). Requests the client
 cancelled with `notifications/cancelled` are not waited for, since MCP forbids answering them.
 
+Ctrl+C (SIGINT) stops the server at once, even while the client keeps stdin open, with exit code 130
+and one `interrupted (Ctrl+C), server stopped` log line. The read pending on stdin cannot be
+cancelled, so it runs in a daemon thread that is simply abandoned; in one of anyio's worker threads
+it would keep the process alive until the client closed stdin.
+
 ## Tools
 
 | Tool | Arguments | Notes |
 |------|-----------|-------|
-| `get_customer_record` | `customer_id`: `CUST-` + exactly 5 digits | Read-only, idempotent |
+| `get_customer_record` | `customer_id`: `CUST-` + exactly 5 ASCII digits | Read-only, idempotent |
 | `trigger_refund` | `customer_id`; `amount`: number, `0 < amount <= 1,000,000`, finite, max 2 decimals; `reason`: 10-500 characters after trimming, no control or invisible format characters | Destructive, not idempotent |
+
+Both tools are annotated `openWorldHint: false`: they work on the server's own in-memory store, a
+closed domain. Backed by a real CRM or payments provider, both would become open-world.
 
 Seed customers: `CUST-10001` to `CUST-10003` are active, `CUST-10004` is suspended and `CUST-10005` is
 closed.
+
+### Interpretations
+
+The task leaves a few details open. These are the readings the server implements:
+
+- **`CUST-XXXXX` means `CUST-` and exactly five ASCII digits** (`CUST-00000` to `CUST-99999`): `X` is
+  read as a digit placeholder, as in the seed IDs. Letters, other separators, other lengths and
+  look-alike digits from other scripts (`CUST-١٢٣٤٥`) are malformed (`-32602`); a well-formed ID that
+  matches no customer is a business error (`customer_not_found`).
+- **The amount is capped at 1,000,000** in the account currency. A refund larger than any plausible
+  order is far likelier to be a mistake (a misplaced decimal point, cents sent as units) than a real
+  refund, and rejecting it as invalid input stops it before any business logic runs. The refundable
+  balance check still applies below the cap.
+- **At most 2 decimal places**, because refunds are in cents. The check reads the amount as the
+  shortest decimal that round-trips the received IEEE-754 double (`repr`), so it is exact for every
+  amount a client can mean: any decimal with up to 15 significant digits survives the round trip,
+  and amounts up to `1000000.00` have at most 9. Every cent from `0.01` to `100.00` and from
+  `999900.00` to `1000000.00` is accepted and converted to exactly that `Decimal`. What it rejects
+  is client-side float arithmetic that did not land on a cent (`0.1 + 0.2` arrives as
+  `0.30000000000000004`): the server refuses to guess which cent was meant.
 
 ### Validation
 
@@ -125,12 +158,16 @@ field-level `data`, where the SDK alone sends an empty string.
 | Situation | Code | `id` in the reply |
 |-----------|------|-------------------|
 | Line is not JSON as the SDK parses it: invalid UTF-8 (even inside a string), `NaN` / `Infinity`, lone surrogate escapes (`"\ud800"`), nesting deeper than ~200 levels, trailing data | `-32700` Parse error | the request's `id` if it can still be recovered, else `null` |
-| Batch array (MCP removed JSON-RPC batching) | `-32600` Invalid Request | `null` |
+| Batch array (not supported, see below) | `-32600` Invalid Request, `data: "Batch requests are not supported"` | `null` |
 | JSON but not a valid request: wrong `jsonrpc`, missing/non-string `method`, `method` combined with `result`/`error`, non-object `params` | `-32600` Invalid Request | echoed if valid |
 | `id` that is not a string or integer (`true`, `null`, `1.5`, ...) | `-32600` Invalid Request | `null` |
-| Unknown method | `-32601` Method not found | echoed |
-| Unknown tool, malformed/missing/extra tool arguments | `-32602` Invalid params | echoed |
+| Unknown method | `-32601` Method not found; `data` is the method name only if it looks like one | echoed |
+| `tools/*` (any method but `initialize` and `ping`) before `initialize` | `-32602` Invalid request parameters, `data: ""` (the SDK's own answer) | echoed |
+| Malformed `tools/call` params (`arguments` not an object, `name` missing or not a string) | `-32602` Invalid request parameters, field-level `data` | echoed |
+| Unknown tool, malformed/missing/extra tool arguments | `-32602` Invalid params, field-level `data` | echoed |
 | Unexpected server fault | `-32603` Internal error. The traceback goes to stderr; the wire gets no internals | echoed |
+| Server shut down while the request was running (still running 30 s after stdin EOF, or Ctrl+C) | `-32000` Connection closed | echoed |
+| Unknown customer, inactive account, refund above balance | not an error: a result with `isError: true` (see above) | |
 | Blank line, notification, client response (a malformed one is logged on stderr) | no reply (JSON-RPC never answers these) | |
 
 The first four rows are handled in `stdio.py` before the SDK sees the line. The SDK's stdin reader
@@ -149,15 +186,41 @@ only when the id cannot be detected, so when a lenient parse of the same line st
 id (a lone surrogate from a JavaScript client that split an emoji, a stray invalid byte in a string),
 the error echoes it and the client can match the error to the request it is waiting on.
 
+### Protocol notes
+
+- **Versions.** The SDK negotiates the handshake versions `2024-11-05` through `2025-11-25`, and
+  serves `2026-07-28` clients that send the per-request `_meta` envelope instead of `initialize`.
+- **Batches are rejected at every version.** MCP removed JSON-RPC batching in `2025-06-18`, but
+  `2025-03-26` required servers to accept batches, and the server still negotiates `2025-03-26`.
+  Neither the official SDK nor this server implements batches, so a `2025-03-26` client that sends
+  one gets a single `-32600` with `id: null` (`data: "Batch requests are not supported"`) and must
+  send its requests one per line. This is a known deviation from that one protocol version.
+- **Before `initialize`,** every method other than `initialize` and `ping` is refused by the SDK
+  with `-32602 Invalid request parameters` and an empty `data` (and an unknown method gets
+  `-32601`, as at any time). The server passes this through unchanged; a client that sends
+  `notifications/initialized` late is still served, because the SDK only requires `initialize` to
+  have succeeded.
+
 ## Use from an MCP host
+
+Hosts launch the server without your shell's `PATH` or virtual environment, so point them at the
+environment's interpreter or console script by absolute path:
 
 ```json
 {
   "mcpServers": {
-    "customer-service": { "command": "customer-mcp", "args": ["--log-level", "INFO"] }
+    "customer-service": {
+      "command": "/path/to/task1-mcp-server/.venv/bin/python",
+      "args": ["-m", "customer_mcp", "--log-level", "INFO"]
+    }
   }
 }
 ```
+
+On Windows use `"command": "C:\\path\\to\\task1-mcp-server\\.venv\\Scripts\\python.exe"` (JSON
+doubles each backslash), or that directory's `customer-mcp.exe` without the `-m customer_mcp`
+arguments. A bare `"command": "customer-mcp"` works only when that environment's scripts directory
+is on the host's `PATH`.
 
 ## stdout isolation
 
@@ -204,9 +267,15 @@ pytest
 
 | File | Covers |
 |------|--------|
-| `test_schemas.py` | Validation edge cases for every field |
-| `test_tools.py` | Tool behaviour through the SDK client (in-process), incl. concurrent refunds |
-| `test_frames.py` | Envelope validation of raw stdin lines |
-| `test_protocol_errors.py` | Every JSON-RPC error code, asserted on the real binary's stdout |
-| `test_stdio_transport.py` | Handshake, stderr-only logging, stray-output isolation (startup, serving, exit; buffered and unbuffered), closed stdin/stdout, official SDK client over stdio |
-| `test_shutdown.py` | Every request read before stdin EOF is answered (10 parallel replays), cancelled and stuck requests |
+| `test_schemas.py` | Validation edge cases for every field (format characters, joiners, NFC, every cent at both ends of the range); the published `inputSchema` checked against the server with `jsonschema` |
+| `test_tools.py` | Tool behaviour through the SDK client (in-process), incl. concurrent refunds; success results validated against `outputSchema`, error results against the error schema |
+| `test_frames.py` | Line splitting of stdin (`\n` only, reads that span chunks, cancelled reads) and frame validation of each line, incl. a differential test against the SDK's own parser |
+| `test_protocol_errors.py` | Every JSON-RPC error code, asserted on the real binary's stdout, incl. which names may be echoed |
+| `test_stdio_transport.py` | Handshake, stderr-only logging, stray-output isolation (before `main()`, startup, serving, exit; buffered and unbuffered), closed stdin/stdout, pre-`initialize` and batch behaviour, official SDK client over stdio |
+| `test_shutdown.py` | Every request read before stdin EOF is answered (10 parallel replays of a scripted session), cancelled and stuck requests, Ctrl+C with stdin still open |
+| `test_cli.py` | `--log-level` and `CUSTOMER_MCP_LOG_LEVEL` validation |
+
+The wire tests launch the real server as a subprocess, as a host does, and never set
+`PYTHONUNBUFFERED` unless a test asks for it. Helper servers in `tests/` misbehave on purpose:
+`noisy_server.py` (stray output), `slow_server.py` (refunds that never finish) and
+`interrupt_server.py` (Ctrl+C mid-session).

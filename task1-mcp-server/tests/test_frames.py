@@ -1,11 +1,17 @@
-"""Unit tests for inbound frame validation (`check_frame`), the layer in front of the SDK."""
+"""Unit tests for inbound framing: `LinePump` splits stdin into lines and `check_frame` validates
+each one, the layer in front of the SDK."""
 
 from __future__ import annotations
 
+import io
+import os
+import threading
+
+import anyio
 import mcp_types as types
 import pytest
 
-from customer_mcp.stdio import DROP, check_frame
+from customer_mcp.stdio import DROP, LinePump, check_frame
 
 
 def nested(depth: int) -> str:
@@ -239,3 +245,55 @@ def test_error_data_never_echoes_input() -> None:
         dumped = check.error.model_dump_json()
         assert secret not in dumped
         assert "123-45-6789" not in dumped
+
+
+async def read_all(pump: LinePump) -> list[bytes]:
+    lines = []
+    while line := await pump.readline():
+        lines.append(line)
+    return lines
+
+
+@pytest.mark.anyio
+async def test_line_pump_splits_a_pipe_on_lf_only() -> None:
+    big = b'{"reason":"' + b"x" * 200_000 + b'"}\n'  # spans several 64 KiB reads
+    chunks = [b'{"a":', b"1}\n", b'{"b":2}\r\n{"c":', b'"3\r4"}\n', big, b"no newline at EOF"]
+    read_fd, write_fd = os.pipe()
+
+    def write() -> None:
+        with os.fdopen(write_fd, "wb", buffering=0) as writer:
+            for chunk in chunks:
+                writer.write(chunk)
+
+    writer = threading.Thread(target=write)
+    writer.start()
+    source = os.fdopen(read_fd, "rb")
+    pump = LinePump(source)
+    lines = await read_all(pump)
+    writer.join(timeout=10)
+
+    # CRLF stays a line ending, a bare CR stays inside its line, the unterminated tail is kept.
+    assert lines == [b'{"a":1}\n', b'{"b":2}\r\n', b'{"c":"3\r4"}\n', big, b"no newline at EOF"]
+    assert not source.closed
+    pump.close()  # the reader reached EOF, so the descriptor is released
+    assert source.closed
+
+
+@pytest.mark.anyio
+async def test_line_pump_reads_in_memory_streams() -> None:
+    pump = LinePump(io.BytesIO(b"one\ntwo\r\nthree"))
+    assert await read_all(pump) == [b"one\n", b"two\r\n", b"three"]
+
+
+@pytest.mark.anyio
+async def test_a_cancelled_read_returns_at_once_and_leaves_its_stream_open() -> None:
+    # Ctrl+C while the client keeps stdin open: the pending read is abandoned, not waited for.
+    read_fd, write_fd = os.pipe()
+    source = os.fdopen(read_fd, "rb")
+    pump = LinePump(source)
+    with anyio.fail_after(5), anyio.move_on_after(0.2) as wait:
+        await pump.readline()  # nothing to read
+    assert wait.cancelled_caught
+    pump.close()
+    assert not source.closed  # the daemon thread may still be blocked reading it
+    os.close(write_fd)  # lets that thread see EOF and finish

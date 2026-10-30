@@ -41,6 +41,50 @@ def test_logs_are_written_to_stderr_only() -> None:
     assert all(b"starting" not in line for line in client.stdout_lines)
 
 
+def test_tools_before_initialize_get_the_sdks_invalid_params() -> None:
+    # Documented SDK behaviour, passed through unchanged: only `ping` is served before the handshake.
+    with StdioWireClient() as client:
+        assert client.request("tools/list")["error"] == {
+            "code": types.INVALID_PARAMS,
+            "message": "Invalid request parameters",
+            "data": "",
+        }
+        assert client.request("ping")["result"] == {}
+        assert client.request("no/such")["error"]["code"] == types.METHOD_NOT_FOUND
+    assert_pure_jsonrpc(client.stdout_lines)
+
+
+def test_batches_are_rejected_even_at_2025_03_26() -> None:
+    # 2025-03-26 required servers to accept batches; neither the SDK nor this server does (README).
+    with StdioWireClient() as client:
+        init = client.request(
+            "initialize",
+            {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "t", "version": "1"},
+            },
+        )
+        assert init["result"]["protocolVersion"] == "2025-03-26"
+        client.notify("notifications/initialized")
+        client.send(
+            [
+                {"jsonrpc": "2.0", "id": "b1", "method": "ping"},
+                {"jsonrpc": "2.0", "id": "b2", "method": "ping"},
+            ]
+        )
+        assert client.receive() == {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {
+                "code": types.INVALID_REQUEST,
+                "message": "Invalid Request",
+                "data": "Batch requests are not supported",
+            },
+        }
+    assert_pure_jsonrpc(client.stdout_lines)
+
+
 def test_server_exits_cleanly_when_stdin_closes() -> None:
     client = StdioWireClient()
     client.initialize()

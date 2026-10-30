@@ -39,6 +39,9 @@ import contextlib
 import io
 import json
 import logging
+import os
+import queue
+import threading
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -371,11 +374,10 @@ class CheckedLines:
     """
 
     def __init__(self, source: IO[bytes], *, drain_timeout: float | None = None) -> None:
-        self._source = source
+        self._lines = LinePump(source)
         self._replies: ObjectSendStream[SessionMessage] | None = None
         self._bound = anyio.Event()
         self._drain_timeout = EOF_DRAIN_TIMEOUT if drain_timeout is None else drain_timeout
-        self._reading = False
         self.pending = PendingRequests()
 
     def bind_replies(self, replies: ObjectSendStream[SessionMessage]) -> None:
@@ -383,21 +385,18 @@ class CheckedLines:
         self._bound.set()
 
     def close(self) -> None:
-        """Release the input stream, unless a worker thread may still be blocked reading it.
-
-        A descriptor closed under a blocked reader could be recycled for an unrelated file, so it
-        is then left to the process exit instead.
-        """
-        if not self._reading:
-            with contextlib.suppress(OSError):
-                self._source.close()
+        self._lines.close()
 
     def __aiter__(self) -> CheckedLines:
         return self
 
     async def __anext__(self) -> str:
         while True:
-            raw = await self._readline()
+            try:
+                raw = await self._lines.readline()
+            except OSError as exc:
+                logger.error("reading stdin failed (%s); treating it as the end of input", exc)
+                raw = b""
             if not raw:
                 await self._drain()
                 raise StopAsyncIteration
@@ -409,13 +408,6 @@ class CheckedLines:
                 await self._answer(check.error)
             elif check.problem is not None:
                 logger.warning("dropped malformed response from the client: %s", check.problem)
-
-    async def _readline(self) -> bytes:
-        # A binary readline splits on b"\n" only: a bare CR stays inside its frame.
-        self._reading = True
-        raw = await anyio.to_thread.run_sync(self._source.readline)
-        self._reading = False  # not reached if the read raised: the stream is then left open
-        return raw
 
     def _track(self, message: types.JSONRPCMessage | None) -> None:
         if isinstance(message, types.JSONRPCRequest):
@@ -447,3 +439,87 @@ class CheckedLines:
         assert self._replies is not None
         with contextlib.suppress(anyio.BrokenResourceError, anyio.ClosedResourceError):
             await self._replies.send(SessionMessage(reply))
+
+
+# ---------------------------------------------------------------------------------------------
+# Reading stdin
+# ---------------------------------------------------------------------------------------------
+_READ_CHUNK = 64 * 1024
+_MAX_QUEUED_LINES = 64
+_WAKE = object()
+
+
+class LinePump:
+    """Reads `\\n`-terminated lines from a blocking byte stream in a daemon thread.
+
+    A blocking read on a pipe cannot be cancelled. Done in one of anyio's worker threads, a read
+    still pending when Ctrl+C arrives keeps the process alive until the client closes stdin: those
+    are not daemon threads, and the interpreter waits for them at exit. This thread is a daemon, so
+    it is simply left behind. It reads with `os.read`, holding no buffered-stream lock that
+    interpreter shutdown could need. Lines are split on `\\n` only, so a bare CR stays in its frame.
+    """
+
+    def __init__(self, source: IO[bytes]) -> None:
+        self._source = source
+        # Bounded: when the server falls behind, the thread stops reading and the client blocks.
+        self._queue: queue.Queue[object] = queue.Queue(_MAX_QUEUED_LINES)
+        self._thread: threading.Thread | None = None
+        self._finished = False
+
+    async def readline(self) -> bytes:
+        """The next line, including its `\\n`; the last bytes before EOF; `b""` at EOF."""
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._run, name="customer-mcp stdin", daemon=True)
+            self._thread.start()
+        item: object = _WAKE
+        while item is _WAKE:  # a wake-up left over from an earlier cancelled read
+            try:
+                item = await anyio.to_thread.run_sync(self._queue.get, abandon_on_cancel=True)
+            except anyio.get_cancelled_exc_class():
+                # The worker thread is still blocked in get(): wake it, or it would hold up the exit.
+                with contextlib.suppress(queue.Full):
+                    self._queue.put_nowait(_WAKE)
+                raise
+        if isinstance(item, BaseException):
+            self._finished = True
+            raise item
+        assert isinstance(item, bytes)
+        if not item:
+            self._finished = True
+        return item
+
+    def close(self) -> None:
+        """Release the stream once the reader is done with it.
+
+        While the thread may still be blocked in a read, the descriptor is left to the process exit:
+        closed under the reader, it could be recycled for an unrelated file.
+        """
+        if self._thread is None or self._finished:
+            with contextlib.suppress(OSError):
+                self._source.close()
+
+    def _run(self) -> None:
+        try:
+            try:
+                fd = self._source.fileno()
+            except (AttributeError, OSError, ValueError):  # an in-memory stream
+                for line in iter(self._source.readline, b""):
+                    self._queue.put(line)
+            else:
+                self._split_lines(fd)
+            self._queue.put(b"")
+        except Exception as exc:  # re-raised on the event loop side, where it can be logged
+            self._queue.put(exc)
+
+    def _split_lines(self, fd: int) -> None:
+        pending = bytearray()
+        while chunk := os.read(fd, _READ_CHUNK):
+            start = 0
+            search_from = len(pending)  # what is already pending holds no b"\n"
+            pending += chunk
+            while (end := pending.find(b"\n", search_from)) != -1:
+                self._queue.put(bytes(pending[start : end + 1]))
+                start = search_from = end + 1
+            del pending[:start]
+        if pending:
+            self._queue.put(bytes(pending))

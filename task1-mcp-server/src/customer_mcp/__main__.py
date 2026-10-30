@@ -14,9 +14,11 @@ from collections.abc import Sequence
 
 from customer_mcp import SERVER_NAME, __version__
 from customer_mcp.claim import WireUnavailableError, claim_stdio
-from customer_mcp.logging_config import configure_logging
+from customer_mcp.logging_config import LOG_LEVEL_ENV, LOG_LEVELS, configure_logging
 
 logger = logging.getLogger("customer_mcp")
+
+EXIT_INTERRUPTED = 130  # 128 + SIGINT, what shells report for a process stopped by Ctrl+C
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -26,8 +28,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--log-level",
+        type=str.upper,
+        choices=LOG_LEVELS,
         default=None,
-        help="DEBUG, INFO, WARNING or ERROR (default: $CUSTOMER_MCP_LOG_LEVEL or INFO)",
+        help=f"log level, case-insensitive (default: ${LOG_LEVEL_ENV} or INFO)",
     )
     args = parser.parse_args(argv)
 
@@ -42,16 +46,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     for note in wire.notes:
         logger.warning("%s", note)
 
-    import anyio
-
-    from customer_mcp.server import create_server
-    from customer_mcp.stdio import serve_stdio
-
-    logger.info("starting %s v%s on stdio", SERVER_NAME, __version__)
     try:
+        import anyio
+
+        from customer_mcp.server import create_server
+        from customer_mcp.stdio import serve_stdio
+
+        logger.info("starting %s v%s on stdio", SERVER_NAME, __version__)
         anyio.run(serve_stdio, create_server(), wire)
     except KeyboardInterrupt:
-        logger.info("interrupted, shutting down")
+        # stdin may still be open: the read pending on it is abandoned, not waited for.
+        logger.info("interrupted (Ctrl+C), server stopped")
+        return EXIT_INTERRUPTED
     logger.info("stdin closed, server stopped")
     return 0
 

@@ -1,8 +1,10 @@
-"""Shutdown behaviour: closing stdin must not cost the client any reply it is owed."""
+"""Shutdown behaviour: closing stdin must not cost the client any reply it is owed, and Ctrl+C
+must stop the server even while the client keeps stdin open."""
 
 from __future__ import annotations
 
 import json
+import signal
 import subprocess
 import sys
 import time
@@ -11,11 +13,13 @@ from pathlib import Path
 from typing import IO, Any
 
 import mcp_types as types
+import pytest
 
-from .wire import HANDSHAKE_VERSION, SERVER_CMD, assert_pure_jsonrpc, server_env
+from .wire import HANDSHAKE_VERSION, SERVER_CMD, StdioWireClient, assert_pure_jsonrpc, server_env
 
 RUNS = 10
 SLOW_SERVER = [sys.executable, str(Path(__file__).with_name("slow_server.py"))]
+INTERRUPT_SERVER = [sys.executable, str(Path(__file__).with_name("interrupt_server.py"))]
 REASON = "Item arrived damaged in transit"
 INITIALIZED = {"jsonrpc": "2.0", "method": "notifications/initialized"}
 
@@ -154,3 +158,34 @@ def test_a_request_that_never_finishes_is_bounded_and_still_answered() -> None:
     assert answered[7]["error"]["code"] == types.CONNECTION_CLOSED
     assert elapsed < 15, f"shutdown took {elapsed:.1f}s"
     assert "1 request(s) still unanswered" in result.stderr.decode()
+
+
+@pytest.mark.parametrize(
+    "delivery",
+    [
+        "simulated",
+        pytest.param(
+            "real-sigint",
+            marks=pytest.mark.skipif(sys.platform == "win32", reason="SIGINT cannot target one process"),
+        ),
+    ],
+)
+def test_ctrl_c_stops_the_server_while_stdin_is_still_open(delivery: str) -> None:
+    # The pending stdin read cannot be cancelled; it must not keep the process alive either.
+    args = [*INTERRUPT_SERVER, "--simulate"] if delivery == "simulated" else INTERRUPT_SERVER
+    with StdioWireClient(args=args) as client:
+        client.initialize()
+        lookup = {"name": "get_customer_record", "arguments": {"customer_id": "CUST-10001"}}
+        assert client.request("tools/call", lookup)["result"]["isError"] is False
+        if delivery == "real-sigint":
+            client.proc.send_signal(signal.SIGINT)
+        started = time.monotonic()
+        exit_code = client.proc.wait(timeout=15)  # stdin is still open
+        elapsed = time.monotonic() - started
+
+    assert exit_code == 130
+    assert elapsed < 10, f"took {elapsed:.1f}s to stop"
+    assert client.stderr.count("interrupted (Ctrl+C), server stopped") == 1
+    assert "stdin closed" not in client.stderr
+    assert "Traceback" not in client.stderr
+    assert_pure_jsonrpc(client.stdout_lines)

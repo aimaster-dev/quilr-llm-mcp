@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -93,6 +94,14 @@ class TestRefundAmount:
         with pytest.raises(ValidationError) as exc:
             TriggerRefundInput.model_validate({**VALID_REFUND, "amount": amount})
         assert error_types(exc) == {expected}
+
+    def test_two_decimal_rule_is_exact_for_every_cent(self) -> None:
+        # The README's claim: every cent a client can mean is accepted and converts to exactly that
+        # Decimal (checked at both ends of the range, where float spacing is finest and coarsest).
+        for cents in (*range(1, 10_001), *range(99_990_000, 100_000_001)):
+            literal = f"{cents // 100}.{cents % 100:02d}"
+            model = TriggerRefundInput.model_validate({**VALID_REFUND, "amount": float(literal)})
+            assert Decimal(repr(model.amount)) == Decimal(literal)
 
     @pytest.mark.parametrize("amount", ["25.00", "1e3", True, False, None, [25], {"value": 25}])
     def test_rejects_non_numbers_without_coercion(self, amount: Any) -> None:
