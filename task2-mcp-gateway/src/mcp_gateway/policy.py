@@ -138,10 +138,13 @@ def check_routing_headers(message: Message, headers: Iterable[tuple[str, str]]) 
     intermediaries can route without parsing JSON. The gateway authorizes the body. If a header
     said something else, a component trusting the header could run a call the gateway never
     authorized. Absent headers are fine: earlier protocol versions do not send them.
+
+    `Mcp_Name` counts as `Mcp-Name`: CGI/WSGI servers read both as `HTTP_MCP_NAME`. (The proxy
+    also drops every header whose name contains `_` before forwarding.)
     """
     seen: dict[str, str] = {}
     for name, value in headers:
-        key = name.lower()
+        key = name.lower().replace("_", "-")
         if key in (MCP_METHOD_HEADER, MCP_NAME_HEADER):
             if key in seen:
                 raise _mismatch(message, f"{key} header appears more than once")

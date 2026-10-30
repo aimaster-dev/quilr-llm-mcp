@@ -76,38 +76,69 @@ REQUEST_ID_HEADER = "x-gateway-request-id"
 # - accept-encoding is replaced by "identity": a compressor would buffer SSE events.
 # - The client's credentials stay at the gateway. Forwarding its token would make the downstream
 #   accept a token that was not issued for it (the MCP spec forbids token passthrough).
+# - Forwarding headers would let the client choose the address the downstream believes it has.
+# - content-encoding no longer describes the body: the gateway forwards a re-serialised one (and
+#   refuses a compressed request body with 415 in the first place).
 DROPPED_REQUEST_HEADERS = HOP_BY_HOP_HEADERS | {
     "host",
     "content-length",
+    "content-encoding",
     "expect",
     "accept-encoding",
     "authorization",
     "cookie",
+    "forwarded",
+    "x-real-ip",
 }
+DROPPED_REQUEST_PREFIXES = (IDENTITY_HEADER_PREFIX, "x-forwarded-")
 # The ASGI server sets its own date/server headers; the downstream's would duplicate them.
 DROPPED_RESPONSE_HEADERS = HOP_BY_HOP_HEADERS | {"date", "server"}
 
 _CONTENT_LENGTH = re.compile(r"[0-9]{1,19}")
 
 
+def header_key(name: str | bytes) -> str:
+    """A header name as CGI/WSGI servers read it: case-insensitive, `_` and `-` alike.
+
+    `X_Gateway_Role` and `X-Gateway-Role` both become `HTTP_X_GATEWAY_ROLE` there, so every drop
+    or prefix check compares names in this form.
+    """
+    text = name.decode("latin-1") if isinstance(name, bytes) else name
+    return text.lower().replace("_", "-")
+
+
 def filter_headers(
-    raw: Iterable[tuple[bytes, bytes]], drop: frozenset[str], drop_prefix: str | None = None
+    raw: Iterable[tuple[bytes, bytes]], drop: frozenset[str], drop_prefixes: tuple[str, ...] = ()
 ) -> RawHeaders:
-    """Copy headers (lower-cased names) minus `drop`, `drop_prefix*` and those named by `Connection`."""
+    """Copy headers (lower-cased names) minus `drop`, `drop_prefixes*` and those named by `Connection`.
+
+    Names are compared in `header_key` form, so `_` spellings are dropped too.
+    """
     headers = [(name.lower(), value) for name, value in raw]
     nominated = {
-        token.strip().lower()
+        header_key(token.strip())
         for name, value in headers
-        if name == b"connection"
+        if header_key(name) == "connection"
         for token in value.decode("latin-1").split(",")
     }
     return [
         (name, value)
         for name, value in headers
-        if (key := name.decode("latin-1")) not in drop
+        if (key := header_key(name)) not in drop
         and key not in nominated
-        and not (drop_prefix and key.startswith(drop_prefix))
+        and not key.startswith(drop_prefixes)
     ]
+
+
+def request_headers_to_forward(raw: Iterable[tuple[bytes, bytes]]) -> RawHeaders:
+    """The client's request headers that may reach the downstream.
+
+    Any name containing `_` is dropped outright, as nginx does by default: no standard or MCP header
+    has one, and a downstream that folds `_` into `-` would read it as a header the gateway
+    controls. `filter_headers` also compares names with `_` read as `-`, as a second layer.
+    """
+    kept = filter_headers(raw, DROPPED_REQUEST_HEADERS, DROPPED_REQUEST_PREFIXES)
+    return [(name, value) for name, value in kept if b"_" not in name]
 
 
 def error_response(error: JsonRpcError) -> Response:
@@ -125,6 +156,22 @@ def check_content_type(value: str | None) -> None:
             acceptable = False
     if not acceptable:
         raise JsonRpcError(INVALID_REQUEST, "Content-Type must be application/json (UTF-8)", http_status=415)
+
+
+def check_content_encoding(values: Iterable[str]) -> None:
+    """POST bodies must not be compressed: the gateway parses the bytes it receives.
+
+    It forwards a re-serialised body, so a `Content-Encoding` would no longer describe what the
+    downstream gets. RFC 7694: answer 415 and list the acceptable coding in `Accept-Encoding`.
+    """
+    codings = [token.strip().lower() for value in values for token in value.split(",") if token.strip()]
+    if any(coding != "identity" for coding in codings):
+        raise JsonRpcError(
+            INVALID_REQUEST,
+            "Content-Encoding is not supported: send an uncompressed body",
+            http_status=415,
+            headers={"Accept-Encoding": "identity"},
+        )
 
 
 async def read_body(request: Request, limit: int) -> bytes:
@@ -267,6 +314,7 @@ class Gateway:
                 headers={"Allow": ", ".join(ALLOWED_METHODS)},
             )
         check_content_type(request.headers.get("content-type"))
+        check_content_encoding(request.headers.getlist("content-encoding"))
         message = parse_message(await read_body(request, self.settings.max_body_bytes))
         record.method, record.rpc_id = message.method, message.id
         headers = [(name.decode("latin-1"), value.decode("latin-1")) for name, value in request.headers.raw]
@@ -296,7 +344,7 @@ class Gateway:
     ) -> Response:
         """Send the request downstream and relay the response; transport failures become 502/504."""
         rpc_id = admitted.rpc_id
-        headers = filter_headers(request.headers.raw, DROPPED_REQUEST_HEADERS, IDENTITY_HEADER_PREFIX)
+        headers = request_headers_to_forward(request.headers.raw)
         headers += [
             (b"accept-encoding", b"identity"),
             (SUBJECT_HEADER.encode(), identity.subject.encode()),

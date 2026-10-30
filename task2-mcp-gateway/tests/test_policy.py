@@ -294,6 +294,7 @@ def b64(value: str) -> str:
         [("mcp-method", "tools/call")],
         [("Mcp-Method", "tools/call"), ("Mcp-Name", "get_weather")],
         [("mcp-method", "tools/call"), ("mcp-name", b64("get_weather"))],
+        [("Mcp_Method", "tools/call"), ("Mcp_Name", "get_weather")],
     ],
 )
 def test_consistent_routing_headers_pass(headers: list[tuple[str, str]]) -> None:
@@ -309,6 +310,10 @@ def test_consistent_routing_headers_pass(headers: list[tuple[str, str]]) -> None
         [("mcp-name", "=?base64?not base64?=")],
         [("mcp-name", "get_weather"), ("mcp-name", "admin_reset_key")],
         [("mcp-method", "tools/call"), ("Mcp-Method", "tools/call")],
+        # CGI/WSGI servers read `_` as `-`: these are the same headers to them.
+        [("Mcp_Name", "admin_reset_key")],
+        [("mcp_method", "tools/list")],
+        [("mcp-name", "get_weather"), ("mcp_name", "admin_reset_key")],
     ],
 )
 def test_routing_headers_that_contradict_the_body_are_rejected(headers: list[tuple[str, str]]) -> None:

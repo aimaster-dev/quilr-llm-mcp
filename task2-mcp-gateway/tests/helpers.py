@@ -8,13 +8,17 @@ import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from wsgiref.simple_server import WSGIRequestHandler, make_server
 
 import anyio
 import httpx
 import uvicorn
 from starlette.applications import Starlette
 from starlette.types import ASGIApp
+
+if TYPE_CHECKING:
+    from _typeshed.wsgi import WSGIApplication
 
 from mcp_gateway.auth import Role, mint_token
 from mcp_gateway.config import DEFAULT_JWT_AUDIENCE, DEFAULT_JWT_ISSUER, GatewaySettings
@@ -146,6 +150,29 @@ def asgi_scope(method: str, headers: list[tuple[bytes, bytes]], role: Role = Rol
         "client": ("127.0.0.1", 50000),
         "server": ("gateway.test", 80),
     }
+
+
+class _QuietWSGIRequestHandler(WSGIRequestHandler):
+    def log_message(self, *args: Any) -> None:
+        pass
+
+
+@contextmanager
+def serve_wsgi_in_thread(app: WSGIApplication) -> Iterator[str]:
+    """Serve a WSGI app with the stdlib `wsgiref` server on an ephemeral localhost port; yield its URL.
+
+    `wsgiref`, like every CGI-style server, maps header names to `HTTP_*` keys with `-` turned into
+    `_`, so `X-Gateway-Role` and `X_Gateway_Role` reach the app as the same key.
+    """
+    server = make_server("127.0.0.1", 0, app, handler_class=_QuietWSGIRequestHandler)
+    thread = threading.Thread(target=server.serve_forever, name="wsgiref-test-server", daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=10)
 
 
 @contextmanager
