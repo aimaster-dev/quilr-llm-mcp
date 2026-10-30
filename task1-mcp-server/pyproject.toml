@@ -12,6 +12,9 @@ dependencies = [
   "mcp>=2.3,<3",
   "pydantic>=2.11,<3",
   "anyio>=4.5,<5",
+  # Transitive (uvicorn, httpcore), pinned here as a security floor: h11 < 0.16 is
+  # GHSA-vqfr-h8mv-ghfj (lenient chunked-encoding parsing, request smuggling).
+  "h11>=0.16,<1",
 ]
 
 [project.optional-dependencies]

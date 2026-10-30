@@ -12,9 +12,12 @@ dependencies = [
   "anyio>=4.5,<5",
   "httpx>=0.28,<1",
   "mcp>=2.3,<3",
-  "PyJWT>=2.10,<3",
+  "PyJWT>=2.10.1,<3",
   "starlette>=0.46,<2",
   "uvicorn>=0.30,<1",
+  # Transitive (uvicorn, httpcore), pinned here as a security floor: h11 < 0.16 is
+  # GHSA-vqfr-h8mv-ghfj (lenient chunked-encoding parsing, request smuggling).
+  "h11>=0.16,<1",
 ]
 
 [project.optional-dependencies]
