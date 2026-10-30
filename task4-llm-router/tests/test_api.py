@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from collections import Counter
 from pathlib import Path
@@ -166,7 +167,41 @@ async def test_failed_requests_release_their_reservation(
     assert response.headers["x-ratelimit-remaining"] == "10000"
 
 
-async def test_cancelled_request_releases_its_reservation(tmp_path: Path) -> None:
+async def test_client_disconnect_cancels_routing_and_releases_the_reservation(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The server reports http.disconnect but does not cancel the handler (as uvicorn does)."""
+    caplog.set_level(logging.INFO, logger="llm_router")
+    settings = make_settings(tmp_path, primary_timeout=5.0)
+    primary, secondary = Recorder(ok(delay=30)), Recorder(ok())
+    sent: list = []
+    async with running_gateway(settings, primary, secondary) as gw:
+        hang_up = anyio.Event()
+
+        async def client() -> None:
+            sent.extend(await gw.chat_and_hang_up(hang_up))
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(client)
+            with anyio.fail_after(2):
+                while not primary.requests:
+                    await anyio.sleep(0.01)
+            hung_up_at = anyio.current_time()
+            hang_up.set()
+        handler_returned_after = anyio.current_time() - hung_up_at
+        usage = await gw.usage()
+
+    assert handler_returned_after < 1.0  # not the 5 s primary deadline
+    assert (primary.cancelled, primary.completed) == (1, 0)
+    assert secondary.requests == []  # a client that has gone is not failed over
+    assert usage == 0
+    assert sent == []  # nobody to answer: nothing is sent
+    [record] = [r for r in caplog.records if "client disconnected" in r.getMessage()]
+    assert record.levelno == logging.INFO
+
+
+async def test_outer_cancellation_releases_the_reservation(tmp_path: Path) -> None:
+    """Cancellation from outside the handler (server shutdown) also releases the reservation."""
     settings = make_settings(tmp_path, primary_timeout=5.0)
     primary = Recorder(ok(delay=30))
     async with running_gateway(settings, primary) as gw:

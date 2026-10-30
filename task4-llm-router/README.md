@@ -187,6 +187,12 @@ database is unavailable fails closed with `503 rate_limiter_unavailable`.
 - Release and reconcile run in shielded cancel scopes, and the reservation itself is shielded, so a
   cancelled request cannot leak a reservation. If a reconcile fails anyway, the row keeps its
   upper-bound estimate: errors over-charge for at most one window, never under-charge.
+- **Client disconnects.** uvicorn does not cancel a handler whose client hangs up; it only delivers
+  `http.disconnect` on the ASGI receive channel. Routing therefore runs in a task group next to a
+  watcher that awaits that message (the body has already been read, so it is the only one left).
+  On disconnect the watcher cancels the group: the upstream attempt is abandoned (its connection
+  closed), no failover starts, the reservation is released, an INFO line is logged and nothing is
+  sent. When routing finishes first, the watcher is cancelled before the response goes out.
 
 ### Retry-After
 
@@ -280,6 +286,7 @@ last attempt, and every attempt is logged.
 | Slow-drip body evades socket timeouts | one deadline over the whole attempt |
 | Late primary response used or counted | sequential attempts; cancelled response closed before the secondary starts |
 | Outer cancellation mistaken for a timeout | `move_on_after` only catches its own cancellation |
+| Client hangs up, handler keeps routing and charges it | `http.disconnect` watcher cancels routing; reservation released, no failover |
 | Cancelled request leaks its reservation | shielded reserve, release and reconcile |
 | Late reconcile hits a reused row | UUID reservation ids |
 | Primary pool exhaustion blocks failover | separate connection pool per upstream |
@@ -310,8 +317,8 @@ pytest          # about 180 tests, ~20 s; deadlines are shortened to 250-300 ms 
 | `test_limiter.py` | window sliding and boundaries, per-tenant and sweeper eviction, exact Retry-After, reconcile (incl. over limit), release, restart persistence, raw key absent from DB/WAL bytes, 8 threads and 4 processes on separate connections admitting exactly `floor(limit/cost)`, a Hypothesis property checking every decision and Retry-After against the definition of the window |
 | `test_router.py` | 429/timeout/connect/5xx/malformed failover, policy switches, 4xx not retried, slow-drip body, real-socket check that the timed-out primary sees the connection close, late primary cancelled and never used, outer cancellation, 80 concurrent mixed requests |
 | `test_errors.py` | catalogue, catch-all 500, routing errors, secrets/hostnames/tracebacks/provider and model names never in responses but present in logs with the same request id, Hypothesis property over random secrets |
-| `test_api.py` | auth, headers, reconcile and release accounting, timeout race bounded by the deadline with only the fallback counted, exact Retry-After with an injected clock, validation without echoing input, 40 parallel requests admit exactly `floor(limit/cost)`, two app instances sharing one budget |
-| `test_e2e.py` | uvicorn on ephemeral ports: slow and drip primaries fail over at the deadline and see the gateway hang up; full failover / 503 / 429 walkthrough |
+| `test_api.py` | auth, headers, reconcile and release accounting, timeout race bounded by the deadline with only the fallback counted, client disconnect (receive channel only, no cancellation) and outer cancellation both release, exact Retry-After with an injected clock, validation without echoing input, 40 parallel requests admit exactly `floor(limit/cost)`, two app instances sharing one budget |
+| `test_e2e.py` | uvicorn on ephemeral ports: slow and drip primaries fail over at the deadline and see the gateway hang up; a client that gives up after 0.5 s gets its primary attempt cancelled before the deadline, usage 0 and no secondary call; full failover / 503 / 429 walkthrough |
 
 ## Limitations and trade-offs
 
